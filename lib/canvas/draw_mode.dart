@@ -1,8 +1,5 @@
 import 'dart:math' as math;
-import 'dart:typed_data';
-import 'dart:ui' as ui;
 import 'package:flutter/gestures.dart';
-import 'package:flutter/rendering.dart';
 import 'image_helper_io.dart'
     if (dart.library.html) 'image_helper_web.dart' as imgHelper;
 import 'package:flutter/material.dart';
@@ -17,9 +14,19 @@ import '../services/storage_service.dart';
 import '../services/canvas_clipboard.dart';
 import '../services/export_service.dart';
 import '../widgets/color_palette.dart';
+import '../widgets/paper_painter.dart';
 import '../widgets/shape_painter.dart';
 
 const _uuid = Uuid();
+
+// ---------------------------------------------------------------------------
+// App-level setting: allow finger (touch) drawing
+// ---------------------------------------------------------------------------
+class DrawSettings {
+  DrawSettings._();
+  static final DrawSettings instance = DrawSettings._();
+  bool allowFingerDrawing = false; // OFF by default — pen/mouse only
+}
 
 // ---------------------------------------------------------------------------
 // DrawMode
@@ -43,6 +50,9 @@ class DrawMode extends StatefulWidget {
 
 class DrawModeState extends State<DrawMode> {
   final _storage = StorageService();
+
+  // ── Zoom ──────────────────────────────────────────────────────────────────
+  final TransformationController _xfCtrl = TransformationController();
 
   // ── Tool ─────────────────────────────────────────────────────────────────
   DrawTool _tool = DrawTool.pen;
@@ -68,7 +78,7 @@ class DrawModeState extends State<DrawMode> {
   final List<_Snapshot> _undoStack = [];
   final List<_Snapshot> _redoStack = [];
 
-  // ── Pointer tracking ──────────────────────────────────────────────────────
+  // ── Active pointer count (for pinch-to-zoom guard) ───────────────────────
   int _activePointers = 0;
 
   // ── Shape drawing ─────────────────────────────────────────────────────────
@@ -78,17 +88,21 @@ class DrawModeState extends State<DrawMode> {
 
   // ── Lasso ─────────────────────────────────────────────────────────────────
   bool _drawingLasso = false;
-  bool _lassoReady = false; // true = closed lasso ready to move
+  bool _lassoReady = false;
   List<Offset> _lassoPoints = [];
-  // Items captured inside lasso
   Set<String> _lassoShapeIds = {};
   Set<String> _lassoTextIds = {};
   Set<String> _lassoImageIds = {};
   Set<String> _lassoTableIds = {};
   Set<int> _lassoStrokeIdxs = {};
   Offset? _lassoMoveStart;
-  // Base positions for lasso move
   final Map<String, Offset> _lassoBasePos = {};
+  // Menu anchor for the floating context menu (canvas coords)
+  Offset? _lassoMenuCanvasPos;
+
+  // ── Image context menu ────────────────────────────────────────────────────
+  String? _imageMenuId; // which image has its menu open
+  Offset? _imageMenuPos; // canvas coords of the menu
 
   // ── Move tool ─────────────────────────────────────────────────────────────
   String? _selectedShapeId;
@@ -103,18 +117,11 @@ class DrawModeState extends State<DrawMode> {
   final Map<String, FocusNode> _focusNodes = {};
 
   // ── Table cell controllers ────────────────────────────────────────────────
-  // key = "$tableId:$row:$col"
   final Map<String, TextEditingController> _cellControllers = {};
   final Map<String, FocusNode> _cellFocusNodes = {};
 
-  // ── Image scale ───────────────────────────────────────────────────────────
+  // ── Image scale (pinch) ───────────────────────────────────────────────────
   final Map<String, Size> _imgScaleStart = {};
-
-  // ── Repaint boundary key (for export) ────────────────────────────────────
-  final GlobalKey _repaintKey = GlobalKey();
-
-  // ── Lasso context-menu position ───────────────────────────────────────────
-  Offset? _lassoMenuPos; // where to anchor the floating menu
 
   // ─────────────────────────────────────────────────────────────────────────
   // Lifecycle
@@ -129,6 +136,7 @@ class DrawModeState extends State<DrawMode> {
 
   @override
   void dispose() {
+    _xfCtrl.dispose();
     for (final c in _teControllers.values) c.dispose();
     for (final f in _focusNodes.values) f.dispose();
     for (final c in _cellControllers.values) c.dispose();
@@ -282,7 +290,6 @@ class DrawModeState extends State<DrawMode> {
       _focusNodes.remove(k)?.dispose();
     }
     _initTextControllers();
-    // Rebuild cell controllers
     for (final k in _cellControllers.keys.toList()) {
       _cellControllers.remove(k)?.dispose();
       _cellFocusNodes.remove(k)?.dispose();
@@ -291,15 +298,40 @@ class DrawModeState extends State<DrawMode> {
   }
 
   // ─────────────────────────────────────────────────────────────────────────
+  // Coordinate conversion (screen → canvas)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /// Convert a screen-space pointer position to canvas coordinates,
+  /// accounting for the current zoom/pan transform.
+  Offset _toCanvas(Offset screenPos) {
+    final matrix = Matrix4.copy(_xfCtrl.value);
+    matrix.invert();
+    // Use vector_math-style point transform: apply the inverted matrix to the point
+    final dx = screenPos.dx;
+    final dy = screenPos.dy;
+    final m = matrix.storage;
+    // 4x4 column-major: transform a 2D point (x, y, 0, 1)
+    final rx = m[0] * dx + m[4] * dy + m[12];
+    final ry = m[1] * dx + m[5] * dy + m[13];
+    return Offset(rx, ry);
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
   // Eraser
   // ─────────────────────────────────────────────────────────────────────────
 
+  /// Current zoom scale extracted from the transformation matrix.
+  double get _zoomScale {
+    final m = _xfCtrl.value.storage;
+    return math.sqrt(m[0] * m[0] + m[1] * m[1]);
+  }
+
   void _applyPrecisionErase(Offset pos) {
-    final r = _eraserSize / 2;
+    // Eraser radius is in canvas coordinates, so divide screen-space size by zoom
+    final r = (_eraserSize / 2) / _zoomScale;
     final List<_Stroke> result = [];
     bool changed = false;
 
-    // Erase ink strokes
     for (final stroke in _strokes) {
       final List<int> erased = [];
       for (int i = 0; i < stroke.points.length; i++) {
@@ -339,7 +371,7 @@ class DrawModeState extends State<DrawMode> {
       }
     }
 
-    // Erase shapes: precision — only erase if circle intersects the outline edges
+    // Shapes: only erase when circle hits the visible outline edges
     final List<ShapeItem> remainingShapes = [];
     for (final shape in _shapes) {
       if (_shapeOutlineHitsCircle(shape, pos, r)) {
@@ -359,11 +391,9 @@ class DrawModeState extends State<DrawMode> {
   }
 
   void _applyStrokeErase(Offset pos) {
-    // Whole-stroke eraser: remove any stroke the circle touches
-    final r = _eraserSize / 2;
+    final r = (_eraserSize / 2) / _zoomScale;
     bool changed = false;
 
-    // Erase ink strokes
     final List<_Stroke> result = _strokes.where((stroke) {
       final hit = stroke.points.any((p) => (p - pos).distance <= r) ||
           () {
@@ -377,7 +407,6 @@ class DrawModeState extends State<DrawMode> {
       return !hit;
     }).toList();
 
-    // Erase shapes (whole shape when outline is touched)
     final List<ShapeItem> remainingShapes = [];
     for (final shape in _shapes) {
       if (_shapeOutlineHitsCircle(shape, pos, r)) {
@@ -406,12 +435,11 @@ class DrawModeState extends State<DrawMode> {
     return (closest - center).distance <= r;
   }
 
-  /// Returns true only if the eraser circle intersects the visible OUTLINE
-  /// edges of a shape (not just its bounding box interior).
+  /// True only if the eraser circle intersects the shape's visible outline segments.
   bool _shapeOutlineHitsCircle(ShapeItem shape, Offset center, double r) {
     final rect = Rect.fromLTWH(shape.x, shape.y, shape.width, shape.height);
-    // Build list of outline segments depending on shape type
     final segs = <List<Offset>>[];
+
     switch (shape.shapeType) {
       case 'rectangle':
         segs.addAll([
@@ -422,7 +450,6 @@ class DrawModeState extends State<DrawMode> {
         ]);
         break;
       case 'circle':
-        // Sample ellipse perimeter
         final cx = rect.center.dx, cy = rect.center.dy;
         final rx = rect.width / 2, ry = rect.height / 2;
         const n = 48;
@@ -502,6 +529,18 @@ class DrawModeState extends State<DrawMode> {
   }
 
   // ─────────────────────────────────────────────────────────────────────────
+  // Coordinate helpers
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /// Convert a canvas-space position to screen space (for overlays outside InteractiveViewer).
+  Offset _toScreen(Offset canvasPos) {
+    final m = _xfCtrl.value.storage;
+    final sx = m[0] * canvasPos.dx + m[4] * canvasPos.dy + m[12];
+    final sy = m[1] * canvasPos.dx + m[5] * canvasPos.dy + m[13];
+    return Offset(sx, sy);
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
   // Lasso helpers
   // ─────────────────────────────────────────────────────────────────────────
 
@@ -530,7 +569,6 @@ class DrawModeState extends State<DrawMode> {
       return;
     }
 
-    // Collect everything inside lasso
     _lassoShapeIds = _shapes
         .where((s) => _pointInPoly(s.center, _lassoPoints))
         .map((s) => s.id)
@@ -554,7 +592,6 @@ class DrawModeState extends State<DrawMode> {
       }
     }
 
-    // Store base positions for move
     _lassoBasePos.clear();
     for (final s in _shapes.where((s) => _lassoShapeIds.contains(s.id))) {
       _lassoBasePos['shape:${s.id}'] = Offset(s.x, s.y);
@@ -569,23 +606,21 @@ class DrawModeState extends State<DrawMode> {
       _lassoBasePos['tbl:${t.id}'] = Offset(t.x, t.y);
     }
     for (final idx in _lassoStrokeIdxs) {
-      // Store first point as base
       if (_strokes[idx].points.isNotEmpty) {
         _lassoBasePos['stroke:$idx'] = _strokes[idx].points.first;
       }
     }
 
-    // Compute bounding rect centroid for menu placement
+    // Compute bounding box top-centre for menu anchor
     if (_lassoPoints.isNotEmpty) {
       double minX = _lassoPoints.first.dx, maxX = _lassoPoints.first.dx;
-      double minY = _lassoPoints.first.dy, maxY = _lassoPoints.first.dy;
+      double minY = _lassoPoints.first.dy;
       for (final p in _lassoPoints) {
         if (p.dx < minX) minX = p.dx;
         if (p.dx > maxX) maxX = p.dx;
         if (p.dy < minY) minY = p.dy;
-        if (p.dy > maxY) maxY = p.dy;
       }
-      _lassoMenuPos = Offset((minX + maxX) / 2, minY - 44);
+      _lassoMenuCanvasPos = Offset((minX + maxX) / 2, minY);
     }
 
     setState(() {
@@ -594,8 +629,20 @@ class DrawModeState extends State<DrawMode> {
     });
   }
 
+  void _clearLasso() {
+    setState(() {
+      _lassoReady = false;
+      _lassoPoints = [];
+      _lassoShapeIds = {};
+      _lassoTextIds = {};
+      _lassoImageIds = {};
+      _lassoTableIds = {};
+      _lassoStrokeIdxs = {};
+      _lassoMenuCanvasPos = null;
+    });
+  }
+
   void _applyLassoMove(Offset delta) {
-    // delta is incremental (difference from last frame) — just add directly
     for (int i = 0; i < _shapes.length; i++) {
       if (_lassoShapeIds.contains(_shapes[i].id)) {
         _shapes[i] = _shapes[i].copyWith(
@@ -621,29 +668,200 @@ class DrawModeState extends State<DrawMode> {
       }
     }
     for (final idx in _lassoStrokeIdxs) {
-      // For strokes we translate every point by delta directly
-      // (base tracking for strokes is done per-pointer-down, not cumulative)
       final stroke = _strokes[idx];
       _strokes[idx] = _Stroke(
         points: stroke.points.map((p) => p + delta).toList(),
         color: stroke.color,
         width: stroke.width,
       );
-      // Update base to new first point
-      if (stroke.points.isNotEmpty) {
-        _lassoBasePos['stroke:$idx'] =
-            _strokes[idx].points.first;
+    }
+    _lassoPoints = _lassoPoints.map((p) => p + delta).toList();
+    if (_lassoMenuCanvasPos != null) {
+      _lassoMenuCanvasPos = _lassoMenuCanvasPos! + delta;
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Clipboard
+  // ─────────────────────────────────────────────────────────────────────────
+
+  void _lassoCopy() {
+    final cb = CanvasClipboard.instance;
+    cb.copySelection(
+      shapeList: _shapes.where((s) => _lassoShapeIds.contains(s.id)).toList(),
+      textList: _textBoxes.where((t) => _lassoTextIds.contains(t.id)).toList(),
+      imageList: _images.where((i) => _lassoImageIds.contains(i.id)).toList(),
+      tableList: _tables.where((t) => _lassoTableIds.contains(t.id)).toList(),
+      strokeList: _lassoStrokeIdxs.map((i) => _strokes[i].toJson()).toList(),
+    );
+    setState(() {}); // refresh paste button state
+  }
+
+  void _lassoCut() {
+    _lassoCopy();
+    _lassoDelete();
+  }
+
+  void _lassoDelete() {
+    _pushUndo();
+    final shapeIds = Set<String>.from(_lassoShapeIds);
+    final textIds = Set<String>.from(_lassoTextIds);
+    final imgIds = Set<String>.from(_lassoImageIds);
+    final tblIds = Set<String>.from(_lassoTableIds);
+    final strokeIdxs = Set<int>.from(_lassoStrokeIdxs);
+
+    for (final id in textIds) {
+      _teControllers.remove(id)?.dispose();
+      _focusNodes.remove(id)?.dispose();
+    }
+    for (final t in _tables.where((t) => tblIds.contains(t.id))) {
+      for (int r = 0; r < t.rows; r++) {
+        for (int c = 0; c < t.cols; c++) {
+          _cellControllers.remove('${t.id}:$r:$c')?.dispose();
+          _cellFocusNodes.remove('${t.id}:$r:$c')?.dispose();
+        }
       }
     }
-    // Also move lasso outline
-    _lassoPoints = _lassoPoints.map((p) => p + delta).toList();
+
+    final newStrokes = <_Stroke>[];
+    for (int i = 0; i < _strokes.length; i++) {
+      if (!strokeIdxs.contains(i)) newStrokes.add(_strokes[i]);
+    }
+
+    setState(() {
+      _shapes.removeWhere((s) => shapeIds.contains(s.id));
+      _textBoxes.removeWhere((t) => textIds.contains(t.id));
+      _images.removeWhere((i) => imgIds.contains(i.id));
+      _tables.removeWhere((t) => tblIds.contains(t.id));
+      _strokes = newStrokes;
+    });
+    _clearLasso();
+    widget.onDirty();
+  }
+
+  void _lassoPaste() {
+    final cb = CanvasClipboard.instance;
+    if (cb.isEmpty) return;
+    _pushUndo();
+    const off = Offset(24, 24);
+
+    for (final sj in cb.shapes) {
+      final j = Map<String, dynamic>.from(sj);
+      j['id'] = _uuid.v4();
+      j['x'] = (j['x'] as num).toDouble() + off.dx;
+      j['y'] = (j['y'] as num).toDouble() + off.dy;
+      setState(() => _shapes.add(ShapeItem.fromJson(j)));
+    }
+    for (final tj in cb.textBoxes) {
+      final j = Map<String, dynamic>.from(tj);
+      j['id'] = _uuid.v4();
+      j['x'] = (j['x'] as num).toDouble() + off.dx;
+      j['y'] = (j['y'] as num).toDouble() + off.dy;
+      final tb = TextBoxItem.fromJson(j);
+      final ctrl = TextEditingController(text: tb.text);
+      final focus = FocusNode();
+      _teControllers[tb.id] = ctrl;
+      _focusNodes[tb.id] = focus;
+      ctrl.addListener(() {
+        final idx = _textBoxes.indexWhere((t) => t.id == tb.id);
+        if (idx >= 0) {
+          _textBoxes[idx].text = ctrl.text;
+          widget.onDirty();
+        }
+      });
+      setState(() => _textBoxes.add(tb));
+    }
+    for (final ij in cb.images) {
+      final j = Map<String, dynamic>.from(ij);
+      j['id'] = _uuid.v4();
+      j['x'] = (j['x'] as num).toDouble() + off.dx;
+      j['y'] = (j['y'] as num).toDouble() + off.dy;
+      setState(() => _images.add(ImageItem.fromJson(j)));
+    }
+    for (final tj in cb.tables) {
+      final j = Map<String, dynamic>.from(tj);
+      j['id'] = _uuid.v4();
+      j['x'] = (j['x'] as num).toDouble() + off.dx;
+      j['y'] = (j['y'] as num).toDouble() + off.dy;
+      final tbl = TableItem.fromJson(j);
+      setState(() => _tables.add(tbl));
+      _initCellControllers();
+    }
+    for (final stj in cb.strokes) {
+      final j = Map<String, dynamic>.from(stj);
+      final pts = (j['points'] as List).map((p) {
+        return {
+          'x': (p['x'] as num) + off.dx,
+          'y': (p['y'] as num) + off.dy
+        };
+      }).toList();
+      j['points'] = pts;
+      setState(() => _strokes.add(_Stroke.fromJson(j)));
+    }
+    // Clear clipboard after paste so the paste button goes grey
+    CanvasClipboard.instance.clear();
+    setState(() {}); // refresh paste button grey state
+    widget.onDirty();
+  }
+
+  void _showCanvasPasteMenu() {
+    showDialog(
+      context: context,
+      barrierColor: Colors.transparent,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Einfügen', style: TextStyle(fontSize: 16)),
+        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        content: const Text('Inhalt aus Zwischenablage einfügen?'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Abbrechen')),
+          ElevatedButton(
+            onPressed: () {
+              Navigator.pop(ctx);
+              _lassoPaste();
+            },
+            child: const Text('Einfügen'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _copyImage(String id) {
+    final img = _images.firstWhere((i) => i.id == id,
+        orElse: () =>
+            ImageItem(id: '', x: 0, y: 0, width: 0, height: 0, filePath: ''));
+    if (img.id.isEmpty) return;
+    CanvasClipboard.instance.copySelection(
+      shapeList: [],
+      textList: [],
+      imageList: [img],
+      tableList: [],
+      strokeList: [],
+    );
+    setState(() {});
+  }
+
+  void _cutImage(String id) {
+    _copyImage(id);
+    _deleteImage(id);
   }
 
   // ─────────────────────────────────────────────────────────────────────────
   // Pointer handling
   // ─────────────────────────────────────────────────────────────────────────
 
+  /// Returns true if this pointer event should be ignored (finger when finger drawing is off).
+  bool _ignoredKind(PointerDeviceKind kind) {
+    if (DrawSettings.instance.allowFingerDrawing) return false;
+    return kind == PointerDeviceKind.touch;
+  }
+
   void _onPointerDown(PointerDownEvent e) {
+    if (_ignoredKind(e.kind)) return;
+
+    // Eraser button on stylus
     if (e.kind == PointerDeviceKind.stylus && e.buttons == 2) {
       setState(() {
         _tool = DrawTool.eraser;
@@ -651,32 +869,35 @@ class DrawModeState extends State<DrawMode> {
       });
     }
 
-    final pos = e.localPosition;
+    // Close image menu on any tap
+    if (_imageMenuId != null) {
+      setState(() {
+        _imageMenuId = null;
+        _imageMenuPos = null;
+      });
+    }
 
-    // Lasso: if already closed, start moving
+    final pos = _toCanvas(e.localPosition);
+
+    // Lasso: if ready, start move or deselect
     if (_lassoReady) {
       if (_pointInPoly(pos, _lassoPoints)) {
         _pushUndo();
         _lassoMoveStart = pos;
         return;
       } else {
-        // Tap outside → deselect
-        setState(() {
-          _lassoReady = false;
-          _lassoPoints = [];
-          _lassoShapeIds = {};
-          _lassoTextIds = {};
-          _lassoImageIds = {};
-          _lassoTableIds = {};
-          _lassoStrokeIdxs = {};
-        });
+        _clearLasso();
+        // If not in lasso tool, don't fall through to draw
+        if (_tool != DrawTool.lasso && _tool != DrawTool.pen &&
+            _tool != DrawTool.eraser && _tool != DrawTool.shape) return;
       }
     }
 
     switch (_tool) {
       case DrawTool.pen:
         _pushUndo();
-        final stroke = _Stroke(points: [pos], color: _color, width: _penWidth);
+        final stroke =
+            _Stroke(points: [pos], color: _color, width: _penWidth);
         setState(() {
           _currentStroke = stroke;
           _strokes.add(stroke);
@@ -721,9 +942,9 @@ class DrawModeState extends State<DrawMode> {
   }
 
   void _onPointerMove(PointerMoveEvent e) {
-    final pos = e.localPosition;
+    if (_ignoredKind(e.kind)) return;
+    final pos = _toCanvas(e.localPosition);
 
-    // Lasso move
     if (_lassoReady && _lassoMoveStart != null) {
       final delta = pos - _lassoMoveStart!;
       _lassoMoveStart = pos;
@@ -770,6 +991,8 @@ class DrawModeState extends State<DrawMode> {
   }
 
   void _onPointerUp(PointerUpEvent e) {
+    if (_ignoredKind(e.kind)) return;
+
     if (_lassoReady && _lassoMoveStart != null) {
       _lassoMoveStart = null;
       return;
@@ -787,7 +1010,8 @@ class DrawModeState extends State<DrawMode> {
 
       case DrawTool.shape:
         if (_drawingShape && _shapeStart != null) {
-          final s = _makeShape(_shapeStart!, e.localPosition, ghost: false);
+          final pos = _toCanvas(e.localPosition);
+          final s = _makeShape(_shapeStart!, pos, ghost: false);
           if (s.width.abs() > 6 && s.height.abs() > 6) {
             setState(() => _shapes.add(s));
             widget.onDirty();
@@ -821,10 +1045,7 @@ class DrawModeState extends State<DrawMode> {
     return ShapeItem(
       id: ghost ? '_ghost_' : _uuid.v4(),
       shapeType: _shapeType.name,
-      x: x,
-      y: y,
-      width: w,
-      height: h,
+      x: x, y: y, width: w, height: h,
       colorValue: _color.value,
       strokeWidth: _penWidth,
     );
@@ -941,7 +1162,8 @@ class DrawModeState extends State<DrawMode> {
 
   void _placeTextBox(Offset pos) {
     final id = _uuid.v4();
-    final tb = TextBoxItem(id: id, x: pos.dx, y: pos.dy, colorValue: _color.value);
+    final tb =
+        TextBoxItem(id: id, x: pos.dx, y: pos.dy, colorValue: _color.value);
     _pushUndo();
     final ctrl = TextEditingController();
     final focus = FocusNode();
@@ -979,10 +1201,13 @@ class DrawModeState extends State<DrawMode> {
                     icon: const Icon(Icons.remove),
                     onPressed: () =>
                         setLocal(() => rows = math.max(1, rows - 1))),
-                Text('$rows', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                Text('$rows',
+                    style: const TextStyle(
+                        fontSize: 16, fontWeight: FontWeight.bold)),
                 IconButton(
                     icon: const Icon(Icons.add),
-                    onPressed: () => setLocal(() => rows = math.min(20, rows + 1))),
+                    onPressed: () =>
+                        setLocal(() => rows = math.min(20, rows + 1))),
               ]),
               Row(children: [
                 const Text('Spalten:', style: TextStyle(fontSize: 14)),
@@ -990,10 +1215,13 @@ class DrawModeState extends State<DrawMode> {
                     icon: const Icon(Icons.remove),
                     onPressed: () =>
                         setLocal(() => cols = math.max(1, cols - 1))),
-                Text('$cols', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                Text('$cols',
+                    style: const TextStyle(
+                        fontSize: 16, fontWeight: FontWeight.bold)),
                 IconButton(
                     icon: const Icon(Icons.add),
-                    onPressed: () => setLocal(() => cols = math.min(20, cols + 1))),
+                    onPressed: () =>
+                        setLocal(() => cols = math.min(20, cols + 1))),
               ]),
             ],
           ),
@@ -1010,8 +1238,8 @@ class DrawModeState extends State<DrawMode> {
     ).then((result) {
       if (result == true) {
         final id = _uuid.v4();
-        final tbl = TableItem(
-            id: id, x: pos.dx, y: pos.dy, rows: rows, cols: cols);
+        final tbl =
+            TableItem(id: id, x: pos.dx, y: pos.dy, rows: rows, cols: cols);
         _pushUndo();
         setState(() => _tables.add(tbl));
         _initCellControllers();
@@ -1020,7 +1248,10 @@ class DrawModeState extends State<DrawMode> {
     });
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
   // Delete helpers
+  // ─────────────────────────────────────────────────────────────────────────
+
   void _deleteShape(String id) {
     _pushUndo();
     setState(() {
@@ -1046,16 +1277,21 @@ class DrawModeState extends State<DrawMode> {
     setState(() {
       _images.removeWhere((i) => i.id == id);
       if (_selectedImageId == id) _selectedImageId = null;
+      if (_imageMenuId == id) {
+        _imageMenuId = null;
+        _imageMenuPos = null;
+      }
     });
     widget.onDirty();
   }
 
   void _deleteTable(String id) {
     _pushUndo();
-    final tbl = _tables.firstWhere((t) => t.id == id, orElse: () => TableItem(id: '', x: 0, y: 0));
+    final tbl = _tables.firstWhere((t) => t.id == id,
+        orElse: () => TableItem(id: '', x: 0, y: 0));
     for (int r = 0; r < tbl.rows; r++) {
       for (int c = 0; c < tbl.cols; c++) {
-        final key = '${id}:$r:$c';
+        final key = '$id:$r:$c';
         _cellControllers.remove(key)?.dispose();
         _cellFocusNodes.remove(key)?.dispose();
       }
@@ -1067,195 +1303,9 @@ class DrawModeState extends State<DrawMode> {
     widget.onDirty();
   }
 
-  // ───────────────────────────────────────────────────────────────────
-  // Clipboard operations
-  // ───────────────────────────────────────────────────────────────────
-
-  Offset _lassoSelectionCentroid() {
-    final allX = <double>[];
-    final allY = <double>[];
-    for (final s in _shapes.where((s) => _lassoShapeIds.contains(s.id))) {
-      allX.add(s.x + s.width / 2);
-      allY.add(s.y + s.height / 2);
-    }
-    for (final t in _textBoxes.where((t) => _lassoTextIds.contains(t.id))) {
-      allX.add(t.x);
-      allY.add(t.y);
-    }
-    for (final i in _images.where((i) => _lassoImageIds.contains(i.id))) {
-      allX.add(i.x + i.width / 2);
-      allY.add(i.y + i.height / 2);
-    }
-    for (final t in _tables.where((t) => _lassoTableIds.contains(t.id))) {
-      allX.add(t.x + t.totalWidth / 2);
-      allY.add(t.y + t.totalHeight / 2);
-    }
-    if (allX.isEmpty) return Offset.zero;
-    final cx = allX.reduce((a, b) => a + b) / allX.length;
-    final cy = allY.reduce((a, b) => a + b) / allY.length;
-    return Offset(cx, cy);
-  }
-
-  void _lassoCopy() {
-    final centroid = _lassoSelectionCentroid();
-    final cb = CanvasClipboard.instance;
-    final selShapes =
-        _shapes.where((s) => _lassoShapeIds.contains(s.id)).toList();
-    final selTexts =
-        _textBoxes.where((t) => _lassoTextIds.contains(t.id)).toList();
-    final selImgs =
-        _images.where((i) => _lassoImageIds.contains(i.id)).toList();
-    final selTbls =
-        _tables.where((t) => _lassoTableIds.contains(t.id)).toList();
-    final selStrokes = _lassoStrokeIdxs
-        .map((i) => _strokes[i].toJson() as dynamic)
-        .toList();
-    cb.copyItems(
-      shapes: selShapes,
-      textBoxes: selTexts,
-      images: selImgs,
-      tables: selTbls,
-      strokes: selStrokes,
-      centroid: centroid,
-    );
-    setState(() {}); // refresh so paste becomes enabled
-  }
-
-  void _lassoCut() {
-    _lassoCopy();
-    _lassoDelete();
-  }
-
-  void _lassoDelete() {
-    _pushUndo();
-    final shapeIds = Set.from(_lassoShapeIds);
-    final textIds = Set.from(_lassoTextIds);
-    final imgIds = Set.from(_lassoImageIds);
-    final tblIds = Set.from(_lassoTableIds);
-    final strokeIdxs = Set.from(_lassoStrokeIdxs);
-
-    for (final id in textIds) _teControllers.remove(id)?.dispose();
-    for (final id in textIds) _focusNodes.remove(id)?.dispose();
-
-    // Remove table cell controllers
-    for (final t in _tables.where((t) => tblIds.contains(t.id))) {
-      for (int r = 0; r < t.rows; r++) {
-        for (int c = 0; c < t.cols; c++) {
-          _cellControllers.remove('${t.id}:$r:$c')?.dispose();
-          _cellFocusNodes.remove('${t.id}:$r:$c')?.dispose();
-        }
-      }
-    }
-
-    final newStrokes = <_Stroke>[];
-    for (int i = 0; i < _strokes.length; i++) {
-      if (!strokeIdxs.contains(i)) newStrokes.add(_strokes[i]);
-    }
-
-    setState(() {
-      _shapes.removeWhere((s) => shapeIds.contains(s.id));
-      _textBoxes.removeWhere((t) => textIds.contains(t.id));
-      _images.removeWhere((i) => imgIds.contains(i.id));
-      _tables.removeWhere((t) => tblIds.contains(t.id));
-      _strokes = newStrokes;
-      _lassoReady = false;
-      _lassoPoints = [];
-      _lassoShapeIds = {};
-      _lassoTextIds = {};
-      _lassoImageIds = {};
-      _lassoTableIds = {};
-      _lassoStrokeIdxs = {};
-      _lassoMenuPos = null;
-    });
-    widget.onDirty();
-  }
-
-  void _lassoPaste() {
-    final cb = CanvasClipboard.instance;
-    if (cb.isEmpty) return;
-    _pushUndo();
-    // Paste with a small offset from original position
-    const offset = Offset(24, 24);
-
-    for (final cs in cb.shapes) {
-      final j = Map<String, dynamic>.from(cs.json);
-      j['id'] = _uuid.v4();
-      j['x'] = (j['x'] as num).toDouble() + offset.dx;
-      j['y'] = (j['y'] as num).toDouble() + offset.dy;
-      setState(() => _shapes.add(ShapeItem.fromJson(j)));
-    }
-    for (final ct in cb.textBoxes) {
-      final j = Map<String, dynamic>.from(ct.json);
-      j['id'] = _uuid.v4();
-      j['x'] = (j['x'] as num).toDouble() + offset.dx;
-      j['y'] = (j['y'] as num).toDouble() + offset.dy;
-      final tb = TextBoxItem.fromJson(j);
-      final ctrl = TextEditingController(text: tb.text);
-      final focus = FocusNode();
-      _teControllers[tb.id] = ctrl;
-      _focusNodes[tb.id] = focus;
-      ctrl.addListener(() {
-        final idx = _textBoxes.indexWhere((t) => t.id == tb.id);
-        if (idx >= 0) {
-          _textBoxes[idx].text = ctrl.text;
-          widget.onDirty();
-        }
-      });
-      setState(() => _textBoxes.add(tb));
-    }
-    for (final ci in cb.images) {
-      final j = Map<String, dynamic>.from(ci.json);
-      j['id'] = _uuid.v4();
-      j['x'] = (j['x'] as num).toDouble() + offset.dx;
-      j['y'] = (j['y'] as num).toDouble() + offset.dy;
-      setState(() => _images.add(ImageItem.fromJson(j)));
-    }
-    for (final ct in cb.tables) {
-      final j = Map<String, dynamic>.from(ct.json);
-      j['id'] = _uuid.v4();
-      j['x'] = (j['x'] as num).toDouble() + offset.dx;
-      j['y'] = (j['y'] as num).toDouble() + offset.dy;
-      final tbl = TableItem.fromJson(j);
-      setState(() => _tables.add(tbl));
-      _initCellControllers();
-    }
-    for (final cst in cb.strokes) {
-      final j = Map<String, dynamic>.from(cst.json);
-      final pts = (j['points'] as List).map((p) {
-        return {'x': (p['x'] as num) + offset.dx, 'y': (p['y'] as num) + offset.dy};
-      }).toList();
-      j['points'] = pts;
-      setState(() => _strokes.add(_Stroke.fromJson(j)));
-    }
-    widget.onDirty();
-  }
-
-  /// Copy a single image to clipboard
-  void _copyImage(String id) {
-    final img = _images.firstWhere((i) => i.id == id,
-        orElse: () => ImageItem(
-            id: '', x: 0, y: 0, width: 0, height: 0, filePath: ''));
-    if (img.id.isEmpty) return;
-    CanvasClipboard.instance.copyItems(
-      shapes: [],
-      textBoxes: [],
-      images: [img],
-      tables: [],
-      strokes: [],
-      centroid: img.center,
-    );
-    setState(() {}); // refresh paste button
-  }
-
-  /// Cut a single image to clipboard
-  void _cutImage(String id) {
-    _copyImage(id);
-    _deleteImage(id);
-  }
-
-  // ───────────────────────────────────────────────────────────────────
-  // Export
-  // ───────────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────────────
+  // Import / Export
+  // ─────────────────────────────────────────────────────────────────────────
 
   Future<void> _showExportImportDialog() async {
     await showDialog(
@@ -1295,7 +1345,6 @@ class DrawModeState extends State<DrawMode> {
   }
 
   void _onImport(String filePath, String fileType) {
-    // For images, add directly to canvas
     if (['jpg', 'jpeg', 'png'].contains(fileType)) {
       _pushUndo();
       setState(() => _images.add(ImageItem(
@@ -1308,12 +1357,10 @@ class DrawModeState extends State<DrawMode> {
           )));
       widget.onDirty();
     } else {
-      // For PDF / Word / PPT: add as a placeholder image item with the path
-      // (full rendering would require native plugins outside scope)
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
             content: Text(
-                'Datei importiert: $filePath\n(Vollansicht in Kürze verfügbar)'),
+                'Datei importiert: $filePath\n(Vollvorschau wird vorbereitet)'),
             duration: const Duration(seconds: 3)),
       );
     }
@@ -1323,12 +1370,12 @@ class DrawModeState extends State<DrawMode> {
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('Clear All'),
-        content: const Text('Remove all drawings on this page?'),
+        title: const Text('Alles löschen'),
+        content: const Text('Alle Zeichnungen auf dieser Seite entfernen?'),
         actions: [
           TextButton(
               onPressed: () => Navigator.pop(ctx),
-              child: const Text('Cancel')),
+              child: const Text('Abbrechen')),
           ElevatedButton(
             style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
             onPressed: () {
@@ -1352,7 +1399,7 @@ class DrawModeState extends State<DrawMode> {
               widget.onDirty();
             },
             child:
-                const Text('Clear', style: TextStyle(color: Colors.white)),
+                const Text('Löschen', style: TextStyle(color: Colors.white)),
           ),
         ],
       ),
@@ -1361,7 +1408,8 @@ class DrawModeState extends State<DrawMode> {
 
   Future<void> _importImage() async {
     try {
-      final xfile = await ImagePicker().pickImage(source: ImageSource.gallery);
+      final xfile =
+          await ImagePicker().pickImage(source: ImageSource.gallery);
       if (xfile == null) return;
       _pushUndo();
       setState(() => _images.add(ImageItem(
@@ -1376,20 +1424,56 @@ class DrawModeState extends State<DrawMode> {
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('Import failed: $e')));
+            .showSnackBar(SnackBar(content: Text('Import fehlgeschlagen: $e')));
       }
     }
   }
 
   Future<void> _exportShare() async {
     try {
-      await Share.share('Exported from Notes – ${widget.page.name}');
+      await Share.share('Exportiert aus Notes – ${widget.page.name}');
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('Export failed: $e')));
+            .showSnackBar(SnackBar(content: Text('Export fehlgeschlagen: $e')));
       }
     }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Settings
+  // ─────────────────────────────────────────────────────────────────────────
+
+  void _showSettings() {
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setLocal) => AlertDialog(
+          title: const Text('Einstellungen'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SwitchListTile(
+                title: const Text('Fingerzeichnen erlauben'),
+                subtitle: const Text(
+                    'Standardmäßig sind nur Stift & Maus aktiv'),
+                value: DrawSettings.instance.allowFingerDrawing,
+                onChanged: (v) {
+                  setLocal(
+                      () => DrawSettings.instance.allowFingerDrawing = v);
+                  setState(() {});
+                },
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Schließen')),
+          ],
+        ),
+      ),
+    );
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -1407,7 +1491,17 @@ class DrawModeState extends State<DrawMode> {
         Expanded(
           child: Stack(
             children: [
-              Listener(
+              // ── Main canvas with zoom ────────────────────────────────────
+              // Finger long-press on empty canvas → paste menu
+              GestureDetector(
+                onLongPress: () {
+                  // Only trigger for touch (finger), not pen/mouse
+                  // Show paste popup at center of screen if clipboard has content
+                  if (!CanvasClipboard.instance.isEmpty) {
+                    _showCanvasPasteMenu();
+                  }
+                },
+                child: Listener(
                 behavior: HitTestBehavior.opaque,
                 onPointerDown: (e) {
                   setState(() => _activePointers++);
@@ -1418,20 +1512,30 @@ class DrawModeState extends State<DrawMode> {
                 },
                 onPointerUp: (e) {
                   _onPointerUp(e);
-                  setState(() =>
-                      _activePointers = math.max(0, _activePointers - 1));
+                  setState(
+                      () => _activePointers = math.max(0, _activePointers - 1));
                 },
                 onPointerCancel: (_) {
-                  setState(() =>
-                      _activePointers = math.max(0, _activePointers - 1));
+                  setState(
+                      () => _activePointers = math.max(0, _activePointers - 1));
                 },
                 child: InteractiveViewer(
+                  transformationController: _xfCtrl,
                   panEnabled: false,
                   minScale: 0.5,
                   maxScale: 5.0,
                   child: SizedBox.expand(
                     child: Stack(
                       children: [
+                        // ── Paper background (zooms with everything) ────────
+                        Positioned.fill(
+                          child: IgnorePointer(
+                            child: CustomPaint(
+                              painter: PaperPainter(widget.page.paperType),
+                            ),
+                          ),
+                        ),
+
                         // ── Ink ────────────────────────────────────────────
                         Positioned.fill(
                           child: IgnorePointer(
@@ -1459,7 +1563,8 @@ class DrawModeState extends State<DrawMode> {
                         ),
 
                         // ── Shape delete handle ────────────────────────────
-                        if (_tool == DrawTool.move && _selectedShapeId != null)
+                        if (_tool == DrawTool.move &&
+                            _selectedShapeId != null)
                           _shapeDeleteHandle(),
 
                         // ── Text boxes ─────────────────────────────────────
@@ -1468,27 +1573,25 @@ class DrawModeState extends State<DrawMode> {
                         // ── Tables ─────────────────────────────────────────
                         ..._buildTables(),
 
-                        // ── Lasso overlay ──────────────────────────────────
+                        // ── Lasso outline ──────────────────────────────────
                         if (_drawingLasso || _lassoReady)
                           Positioned.fill(
                             child: IgnorePointer(
                               child: CustomPaint(
-                                painter: LassoPainter(
-                                  _lassoPoints,
-                                  closed: _lassoReady,
-                                ),
+                                painter: LassoPainter(_lassoPoints,
+                                    closed: _lassoReady),
                               ),
                             ),
                           ),
 
-                        // ── Eraser cursor ──────────────────────────────────
+                        // ── Eraser cursor (canvas-space, radius already in canvas coords) ──────
                         if (_tool == DrawTool.eraser && _eraserPos != null)
                           Positioned.fill(
                             child: IgnorePointer(
                               child: CustomPaint(
                                 painter: _EraserCursorPainter(
                                   position: _eraserPos!,
-                                  radius: _eraserSize / 2,
+                                  radius: (_eraserSize / 2) / _zoomScale,
                                 ),
                               ),
                             ),
@@ -1513,8 +1616,48 @@ class DrawModeState extends State<DrawMode> {
                   ),
                 ),
               ),
+              ), // end GestureDetector (finger long-press paste)
 
-              // ── Colour bubble ──────────────────────────────────────────
+              // ── Lasso context menu (screen-space overlay, outside Listener) ──────
+              if (_lassoReady && _lassoMenuCanvasPos != null)
+                Builder(builder: (_) {
+                  final sp = _toScreen(_lassoMenuCanvasPos!);
+                  return Positioned(
+                    left: (sp.dx - 100).clamp(4.0, double.infinity),
+                    top: math.max(4.0, sp.dy - 52),
+                    child: _buildContextMenu(
+                      onDelete: _lassoDelete,
+                      onCut: _lassoCut,
+                      onCopy: _lassoCopy,
+                      onPaste: CanvasClipboard.instance.isEmpty
+                          ? null
+                          : _lassoPaste,
+                    ),
+                  );
+                }),
+
+              // ── Image context menu (screen-space overlay, outside Listener) ──────
+              if (_imageMenuId != null && _imageMenuPos != null)
+                Builder(builder: (_) {
+                  final sp = _toScreen(_imageMenuPos!);
+                  return Positioned(
+                    left: (sp.dx - 100).clamp(4.0, double.infinity),
+                    top: math.max(4.0, sp.dy - 52),
+                    child: _buildContextMenu(
+                      onDelete: () => _deleteImage(_imageMenuId!),
+                      onCut: () => _cutImage(_imageMenuId!),
+                      onCopy: () => _copyImage(_imageMenuId!),
+                      onPaste: CanvasClipboard.instance.isEmpty
+                          ? null
+                          : _lassoPaste,
+                    ),
+                  );
+                }),
+
+              // ── Table add-row/col overlay buttons (screen-space, outside Listener) ──
+              ..._buildTableOverlayButtons(),
+
+              // ── Colour bubble (outside zoom) ───────────────────────────
               Positioned(
                 bottom: 16,
                 right: 16,
@@ -1537,18 +1680,83 @@ class DrawModeState extends State<DrawMode> {
   }
 
   // ─────────────────────────────────────────────────────────────────────────
+  // Context menu widget (lasso + image)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  Widget _buildContextMenu({
+    required VoidCallback onDelete,
+    required VoidCallback onCut,
+    required VoidCallback onCopy,
+    VoidCallback? onPaste,
+  }) {
+    return Material(
+      elevation: 8,
+      borderRadius: BorderRadius.circular(22),
+      color: Colors.white,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 6),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            _ctxBtn(Icons.delete_outline, Colors.red, 'Löschen', onDelete),
+            _ctxDivider(),
+            _ctxBtn(Icons.content_cut, Colors.orange.shade700, 'Ausschneiden',
+                onCut),
+            _ctxDivider(),
+            _ctxBtn(
+                Icons.copy, Colors.blue.shade700, 'Kopieren', onCopy),
+            _ctxDivider(),
+            _ctxBtn(
+              Icons.content_paste,
+              onPaste != null ? Colors.green.shade700 : Colors.grey.shade400,
+              'Einfügen',
+              onPaste,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _ctxBtn(
+          IconData icon, Color color, String tooltip, VoidCallback? onTap) =>
+      Tooltip(
+        message: tooltip,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(18),
+          onTap: onTap,
+          child: Padding(
+            padding:
+                const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+            child: Icon(icon, size: 20, color: color),
+          ),
+        ),
+      );
+
+  Widget _ctxDivider() => Container(
+        width: 1,
+        height: 22,
+        color: Colors.grey.shade200,
+        margin: const EdgeInsets.symmetric(horizontal: 2),
+      );
+
+  // ─────────────────────────────────────────────────────────────────────────
   // Image widgets
   // ─────────────────────────────────────────────────────────────────────────
 
   List<Widget> _buildImages() {
     return _images.map((img) {
       final isSel = _selectedImageId == img.id && _tool == DrawTool.move;
+      final menuOpen = _imageMenuId == img.id;
+      // Track whether a pan/scale is happening to suppress long-press
+      bool _isGesturing = false;
       return Positioned(
         left: img.x,
         top: img.y,
         width: img.width,
         height: img.height,
         child: GestureDetector(
+          onPanStart: _tool == DrawTool.move ? (_) { _isGesturing = true; } : null,
           onPanUpdate: _tool == DrawTool.move
               ? (d) {
                   setState(() {
@@ -1558,30 +1766,49 @@ class DrawModeState extends State<DrawMode> {
                   widget.onDirty();
                 }
               : null,
-          onScaleStart: (_) =>
-              _imgScaleStart[img.id] = Size(img.width, img.height),
+          onPanEnd: _tool == DrawTool.move ? (_) { _isGesturing = false; } : null,
+          // Long-press (finger only) opens the context menu
+          onLongPress: () {
+            if (_isGesturing) return;
+            setState(() {
+              _imageMenuId = img.id;
+              _imageMenuPos = Offset(img.x + img.width / 2, img.y);
+            });
+          },
+          onScaleStart: (d) {
+            _isGesturing = true;
+            _imgScaleStart[img.id] = Size(img.width, img.height);
+          },
           onScaleUpdate: (d) {
             final base = _imgScaleStart[img.id];
             if (base == null) return;
-            setState(() {
-              img.width = math.max(40, base.width * d.scale);
-              img.height = math.max(30, base.height * d.scale);
-              img.rotation += d.rotation * 0.3;
-            });
-            widget.onDirty();
+            if (_tool == DrawTool.move) {
+              setState(() {
+                img.width = math.max(40, base.width * d.scale);
+                img.height = math.max(30, base.height * d.scale);
+                img.rotation += d.rotation * 0.3;
+              });
+              widget.onDirty();
+            }
           },
-          onScaleEnd: (_) => _imgScaleStart.remove(img.id),
+          onScaleEnd: (_) {
+            _imgScaleStart.remove(img.id);
+            Future.delayed(const Duration(milliseconds: 100), () {
+              _isGesturing = false;
+            });
+          },
           child: Transform.rotate(
             angle: img.rotation,
             child: Stack(
               children: [
-                Positioned.fill(child: imgHelper.buildFileImage(img.filePath)),
+                Positioned.fill(
+                    child: imgHelper.buildFileImage(img.filePath)),
                 if (isSel)
                   Positioned(
                       top: 0,
                       right: 0,
                       child: _delBtn(() => _deleteImage(img.id))),
-                if (_tool == DrawTool.move)
+                if (_tool == DrawTool.move && !menuOpen)
                   Positioned(
                     bottom: 0,
                     right: 0,
@@ -1590,13 +1817,29 @@ class DrawModeState extends State<DrawMode> {
                       height: 22,
                       decoration: BoxDecoration(
                         color: Colors.blue.withOpacity(0.8),
-                        borderRadius:
-                            const BorderRadius.only(topLeft: Radius.circular(6)),
+                        borderRadius: const BorderRadius.only(
+                            topLeft: Radius.circular(6)),
                       ),
                       child: const Icon(Icons.open_in_full,
                           size: 14, color: Colors.white),
                     ),
                   ),
+                // Long-press hint badge
+                Positioned(
+                  bottom: 0,
+                  left: 0,
+                  child: Container(
+                    width: 22,
+                    height: 22,
+                    decoration: BoxDecoration(
+                      color: Colors.black.withOpacity(0.4),
+                      borderRadius: const BorderRadius.only(
+                          topRight: Radius.circular(6)),
+                    ),
+                    child: const Icon(Icons.more_horiz,
+                        size: 13, color: Colors.white),
+                  ),
+                ),
               ],
             ),
           ),
@@ -1663,8 +1906,7 @@ class DrawModeState extends State<DrawMode> {
                     isDense: true,
                     contentPadding: EdgeInsets.zero,
                     hintText: 'Type here…',
-                    hintStyle:
-                        TextStyle(color: Colors.grey, fontSize: 14),
+                    hintStyle: TextStyle(color: Colors.grey, fontSize: 14),
                   ),
                 ),
               ),
@@ -1731,11 +1973,13 @@ class DrawModeState extends State<DrawMode> {
                             border: Border(
                               right: c < tbl.cols - 1
                                   ? BorderSide(
-                                      color: Color(tbl.colorValue), width: 0.8)
+                                      color: Color(tbl.colorValue),
+                                      width: 0.8)
                                   : BorderSide.none,
                               bottom: r < tbl.rows - 1
                                   ? BorderSide(
-                                      color: Color(tbl.colorValue), width: 0.8)
+                                      color: Color(tbl.colorValue),
+                                      width: 0.8)
                                   : BorderSide.none,
                             ),
                           ),
@@ -1765,38 +2009,47 @@ class DrawModeState extends State<DrawMode> {
                     top: -12,
                     right: -12,
                     child: _delBtn(() => _deleteTable(tbl.id))),
-              // Add row/col buttons when selected
-              if (isSel) ...[
-                Positioned(
-                  bottom: -22,
-                  left: 0,
-                  child: _tableBtn(Icons.add, 'Zeile', () {
-                    setState(() {
-                      tbl.rows++;
-                      tbl.cells.add(List.generate(tbl.cols, (_) => ''));
-                    });
-                    _initCellControllers();
-                    widget.onDirty();
-                  }),
-                ),
-                Positioned(
-                  top: 0,
-                  right: -22,
-                  child: _tableBtn(Icons.add, 'Sp.', () {
-                    setState(() {
-                      tbl.cols++;
-                      for (final row in tbl.cells) row.add('');
-                    });
-                    _initCellControllers();
-                    widget.onDirty();
-                  }),
-                ),
-              ],
             ],
           ),
         ),
       );
     }).toList();
+  }
+
+  // Screen-space overlay buttons for selected table (add row / add column)
+  List<Widget> _buildTableOverlayButtons() {
+    if (_tool != DrawTool.move || _selectedTableId == null) return [];
+    final tblIdx = _tables.indexWhere((t) => t.id == _selectedTableId);
+    if (tblIdx < 0) return [];
+    final tbl = _tables[tblIdx];
+    final bottomLeft = _toScreen(Offset(tbl.x, tbl.y + tbl.totalHeight));
+    final topRight   = _toScreen(Offset(tbl.x + tbl.totalWidth, tbl.y));
+    return [
+      Positioned(
+        left: bottomLeft.dx,
+        top: bottomLeft.dy + 4,
+        child: _tableBtn(Icons.add, 'Zeile', () {
+          setState(() {
+            tbl.rows++;
+            tbl.cells.add(List.generate(tbl.cols, (_) => ''));
+          });
+          _initCellControllers();
+          widget.onDirty();
+        }),
+      ),
+      Positioned(
+        left: topRight.dx + 4,
+        top: topRight.dy,
+        child: _tableBtn(Icons.add, 'Sp.', () {
+          setState(() {
+            tbl.cols++;
+            for (final row in tbl.cells) row.add('');
+          });
+          _initCellControllers();
+          widget.onDirty();
+        }),
+      ),
+    ];
   }
 
   Widget _tableBtn(IconData icon, String label, VoidCallback onTap) =>
@@ -1814,7 +2067,8 @@ class DrawModeState extends State<DrawMode> {
             children: [
               Icon(icon, size: 12, color: Colors.blue.shade700),
               Text(label,
-                  style: TextStyle(fontSize: 10, color: Colors.blue.shade700)),
+                  style:
+                      TextStyle(fontSize: 10, color: Colors.blue.shade700)),
             ],
           ),
         ),
@@ -1823,8 +2077,14 @@ class DrawModeState extends State<DrawMode> {
   Widget _shapeDeleteHandle() {
     final shape = _shapes.firstWhere(
       (s) => s.id == _selectedShapeId,
-      orElse: () =>
-          ShapeItem(id: '', shapeType: '', x: 0, y: 0, width: 0, height: 0, colorValue: 0),
+      orElse: () => ShapeItem(
+          id: '',
+          shapeType: '',
+          x: 0,
+          y: 0,
+          width: 0,
+          height: 0,
+          colorValue: 0),
     );
     if (shape.id.isEmpty) return const SizedBox.shrink();
     return Positioned(
@@ -1865,15 +2125,18 @@ class DrawModeState extends State<DrawMode> {
             if (_tool == DrawTool.pen) ...[
               const Text('W:', style: TextStyle(fontSize: 11)),
               SizedBox(
-                width: 80,
+                width: 100,
                 child: Slider(
                     value: _penWidth,
                     min: 1,
-                    max: 12,
-                    onChanged: (v) => setState(() => _penWidth = v)),
+                    max: 20,
+                    divisions: 19,
+                    label: _penWidth.round().toString(),
+                    onChanged: (v) => setState(() => _penWidth = v.roundToDouble())),
               ),
+              Text('${_penWidth.round()}', style: const TextStyle(fontSize: 11, color: Colors.blue)),
+              const SizedBox(width: 4),
             ],
-            // Eraser — tap cycles mode, shows size
             _toolBtnCustom(
               icon: Icons.auto_fix_high,
               tool: DrawTool.eraser,
@@ -1883,10 +2146,10 @@ class DrawModeState extends State<DrawMode> {
                   : null,
               onTap: () {
                 if (_tool == DrawTool.eraser) {
-                  // Cycle mode
-                  setState(() => _eraserMode = _eraserMode == EraserMode.precision
-                      ? EraserMode.stroke
-                      : EraserMode.precision);
+                  setState(() => _eraserMode =
+                      _eraserMode == EraserMode.precision
+                          ? EraserMode.stroke
+                          : EraserMode.precision);
                 } else {
                   setState(() {
                     _tool = DrawTool.eraser;
@@ -1897,7 +2160,9 @@ class DrawModeState extends State<DrawMode> {
             ),
             if (_tool == DrawTool.eraser) ...[
               Text(
-                _eraserMode == EraserMode.precision ? 'Präzision' : 'Linie',
+                _eraserMode == EraserMode.precision
+                    ? 'Präzision'
+                    : 'Linie',
                 style: const TextStyle(fontSize: 10, color: Colors.blue),
               ),
               const SizedBox(width: 4),
@@ -1912,13 +2177,31 @@ class DrawModeState extends State<DrawMode> {
             ],
             _toolBtn(Icons.open_with, DrawTool.move, l10n.move),
             _toolBtn(Icons.text_fields, DrawTool.textBox, l10n.textBox),
-            _toolBtn(Icons.table_chart_outlined, DrawTool.table, 'Tabelle'),
+            _toolBtn(
+                Icons.table_chart_outlined, DrawTool.table, 'Tabelle'),
             _toolBtn(Icons.category_outlined, DrawTool.shape, l10n.shape,
                 onTapOverride: () => setState(() {
                       _tool = DrawTool.shape;
                       _showSubMenu = !_showSubMenu;
                     })),
             _toolBtn(Icons.gesture, DrawTool.lasso, l10n.lasso),
+            const SizedBox(width: 4),
+            // Paste shortcut
+            Tooltip(
+              message: 'Einfügen',
+              child: IconButton(
+                icon: Icon(Icons.content_paste,
+                    size: 22,
+                    color: CanvasClipboard.instance.isEmpty
+                        ? Colors.grey.shade300
+                        : Colors.green.shade600),
+                onPressed: CanvasClipboard.instance.isEmpty
+                    ? null
+                    : _lassoPaste,
+                padding: const EdgeInsets.symmetric(horizontal: 4),
+                constraints: const BoxConstraints(minWidth: 36),
+              ),
+            ),
             const SizedBox(width: 4),
             GestureDetector(
               onTap: _showColorDialog,
@@ -1929,7 +2212,8 @@ class DrawModeState extends State<DrawMode> {
                 decoration: BoxDecoration(
                   color: _color,
                   shape: BoxShape.circle,
-                  border: Border.all(color: Colors.grey.shade400, width: 2),
+                  border:
+                      Border.all(color: Colors.grey.shade400, width: 2),
                 ),
               ),
             ),
@@ -1937,14 +2221,18 @@ class DrawModeState extends State<DrawMode> {
             _actionBtn(Icons.undo, l10n.undo, _undo),
             _actionBtn(Icons.redo, l10n.redo, _redo),
             _actionBtn(Icons.delete_forever, l10n.clearAll, _clearAll),
-            _actionBtn(
-                Icons.add_photo_alternate, l10n.importImage, _importImage),
+            _actionBtn(Icons.add_photo_alternate, l10n.importImage,
+                _importImage),
+            _actionBtn(Icons.import_export, 'Import / Export',
+                _showExportImportDialog),
             _actionBtn(Icons.ios_share, l10n.exportShare, _exportShare),
+            _actionBtn(Icons.settings_outlined, 'Einstellungen',
+                _showSettings),
             _actionBtn(Icons.save_outlined, l10n.save, () async {
               await saveAll();
               if (mounted) {
                 ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-                    content: Text('Saved!'),
+                    content: Text('Gespeichert!'),
                     duration: Duration(seconds: 1)));
               }
             }),
@@ -1964,6 +2252,8 @@ class DrawModeState extends State<DrawMode> {
             () => setState(() {
                   _tool = tool;
                   if (tool != DrawTool.shape) _showSubMenu = false;
+                  // Clear lasso when switching away from lasso tool
+                  if (tool != DrawTool.lasso) _clearLasso();
                 }),
         child: Container(
           margin: const EdgeInsets.symmetric(horizontal: 2, vertical: 6),
@@ -2052,7 +2342,7 @@ class DrawModeState extends State<DrawMode> {
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('Pick Colour'),
+        title: const Text('Farbe wählen'),
         content: ColorPalette(
           selectedColor: _color,
           onColorChanged: (c) {
@@ -2063,7 +2353,7 @@ class DrawModeState extends State<DrawMode> {
         actions: [
           TextButton(
               onPressed: () => Navigator.pop(ctx),
-              child: const Text('Close')),
+              child: const Text('Schließen')),
         ],
       ),
     );
@@ -2102,7 +2392,8 @@ class DrawModeState extends State<DrawMode> {
               style: TextStyle(
                 fontSize: 12,
                 color: active ? Colors.white : Colors.grey.shade700,
-                fontWeight: active ? FontWeight.w600 : FontWeight.normal,
+                fontWeight:
+                    active ? FontWeight.w600 : FontWeight.normal,
               )),
         ),
       );
@@ -2132,8 +2423,8 @@ class _Stroke {
         color: Color(j['color'] as int),
         width: (j['width'] as num).toDouble(),
         points: (j['points'] as List<dynamic>)
-            .map((p) => Offset(
-                (p['x'] as num).toDouble(), (p['y'] as num).toDouble()))
+            .map((p) => Offset((p['x'] as num).toDouble(),
+                (p['y'] as num).toDouble()))
             .toList(),
       );
 }
@@ -2144,14 +2435,11 @@ class _Stroke {
 
 class _InkPainter extends CustomPainter {
   final List<_Stroke> strokes;
-
   _InkPainter({required this.strokes});
 
   @override
   void paint(Canvas canvas, Size size) {
-    for (final s in strokes) {
-      _paintStroke(canvas, s);
-    }
+    for (final s in strokes) _paintStroke(canvas, s);
   }
 
   void _paintStroke(Canvas canvas, _Stroke s) {
@@ -2198,21 +2486,26 @@ class _InkPainter extends CustomPainter {
 class _EraserCursorPainter extends CustomPainter {
   final Offset position;
   final double radius;
-
   _EraserCursorPainter({required this.position, required this.radius});
 
   @override
   void paint(Canvas canvas, Size size) {
-    canvas.drawCircle(position, radius,
+    canvas.drawCircle(
+        position,
+        radius,
         Paint()
           ..color = Colors.white.withOpacity(0.01)
           ..style = PaintingStyle.fill);
-    canvas.drawCircle(position, radius,
+    canvas.drawCircle(
+        position,
+        radius,
         Paint()
           ..color = Colors.black.withOpacity(0.7)
           ..strokeWidth = 1.5
           ..style = PaintingStyle.stroke);
-    canvas.drawCircle(position, radius - 1,
+    canvas.drawCircle(
+        position,
+        radius - 1,
         Paint()
           ..color = Colors.grey.withOpacity(0.15)
           ..strokeWidth = 1.0

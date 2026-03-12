@@ -97,14 +97,8 @@ class _CanvasPageState extends State<CanvasPage>
         Expanded(
           child: Stack(
             children: [
-              // Paper background — always rendered behind everything.
-              Positioned.fill(
-                child: CustomPaint(
-                  painter: PaperPainter(widget.page.paperType),
-                ),
-              ),
-
               // ── Tab 0 : Draw mode ──────────────────────────────────────────
+              // Paper is rendered INSIDE DrawMode so it zooms together with content
               Offstage(
                 offstage: _mode != CanvasMode.draw,
                 child: DrawMode(
