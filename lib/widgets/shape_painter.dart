@@ -50,9 +50,12 @@ class ShapePainter extends CustomPainter {
       case 'circle':
         canvas.drawOval(rect, paint);
         break;
+      // unified triangle — resizable in both directions
+      case 'triangle':
       case 'isoscelesTriangle':
         _drawIsoscelesTriangle(canvas, rect, paint);
         break;
+      // legacy shapes kept for backwards compat
       case 'rightTriangle':
         _drawRightTriangle(canvas, rect, paint);
         break;
@@ -61,6 +64,9 @@ class ShapePainter extends CustomPainter {
         break;
       case 'arrow':
         _drawArrow(canvas, rect, paint);
+        break;
+      case 'lineArrow':
+        _drawLineArrow(canvas, rect, paint);
         break;
       case 'star':
         _drawStar(canvas, rect, paint);
@@ -82,7 +88,6 @@ class ShapePainter extends CustomPainter {
   }
 
   void _drawRightTriangle(Canvas canvas, Rect r, Paint paint) {
-    // Right angle at bottom-left ◺
     final path = Path()
       ..moveTo(r.left, r.top)
       ..lineTo(r.right, r.bottom)
@@ -92,13 +97,32 @@ class ShapePainter extends CustomPainter {
   }
 
   void _drawLeftTriangle(Canvas canvas, Rect r, Paint paint) {
-    // Right angle at bottom-right ◻ mirrored
     final path = Path()
       ..moveTo(r.right, r.top)
       ..lineTo(r.right, r.bottom)
       ..lineTo(r.left, r.bottom)
       ..close();
     canvas.drawPath(path, paint);
+  }
+
+  void _drawLineArrow(Canvas canvas, Rect r, Paint paint) {
+    // Simple horizontal arrow: line + arrowhead
+    final y = r.top + r.height / 2;
+    final headSize = math.min(r.width * 0.25, r.height * 0.6);
+    // Line body
+    canvas.drawLine(
+      Offset(r.left, y),
+      Offset(r.right - headSize * 0.8, y),
+      paint,
+    );
+    // Arrowhead
+    final headPath = Path()
+      ..moveTo(r.right, y)
+      ..lineTo(r.right - headSize, y - headSize * 0.5)
+      ..lineTo(r.right - headSize, y + headSize * 0.5)
+      ..close();
+    canvas.drawPath(headPath,
+        Paint()..color = paint.color..style = PaintingStyle.fill);
   }
 
   void _drawArrow(Canvas canvas, Rect r, Paint paint) {
@@ -168,7 +192,7 @@ class ShapePainter extends CustomPainter {
 }
 
 // ---------------------------------------------------------------------------
-// Helper: convert a ShapeItem into a list of Offset points for erasing
+// Helper: convert a ShapeItem into outline points for erasing
 // ---------------------------------------------------------------------------
 
 List<Offset> shapeToPoints(ShapeItem shape, {int samples = 60}) {
@@ -199,6 +223,7 @@ List<Offset> shapeToPoints(ShapeItem shape, {int samples = 60}) {
         pts.add(Offset(cx + rx * math.cos(a), cy + ry * math.sin(a)));
       }
       break;
+    case 'triangle':
     case 'isoscelesTriangle':
       final apex = Offset(rect.left + rect.width / 2, rect.top);
       addLine(apex, rect.bottomRight);
@@ -251,32 +276,39 @@ List<Offset> shapeToPoints(ShapeItem shape, {int samples = 60}) {
 }
 
 // ---------------------------------------------------------------------------
-// Lasso painter — clean dashed outline, NO fill, NO dots, smooth ellipse
+// Lasso painter
 // ---------------------------------------------------------------------------
 
 class LassoPainter extends CustomPainter {
   final List<Offset> points;
   final bool closed;
-  LassoPainter(this.points, {this.closed = false});
+  /// Animated offset 0.0–1.0 for marching-ants effect.  Pass a [Listenable]
+  /// and update this field each tick to animate.
+  final double marchOffset;
+  LassoPainter(this.points, {this.closed = false, this.marchOffset = 0.0});
 
-  /// When closed, compute a smooth fitted ellipse around all captured points.
-  Path _buildEllipsePath() {
-    if (points.isEmpty) return Path();
-    double minX = points.first.dx, maxX = points.first.dx;
-    double minY = points.first.dy, maxY = points.first.dy;
-    for (final p in points) {
-      if (p.dx < minX) minX = p.dx;
-      if (p.dx > maxX) maxX = p.dx;
-      if (p.dy < minY) minY = p.dy;
-      if (p.dy > maxY) maxY = p.dy;
+  // FIX: draw the actual lasso points as a smooth closed path instead of an
+  // inflated ellipse, so the selection outline matches what the user drew.
+  Path _buildClosedPath() {
+    if (points.length < 3) return Path();
+    // Start at midpoint between last and first point for smooth join
+    final start = Offset(
+      (points.last.dx + points.first.dx) / 2,
+      (points.last.dy + points.first.dy) / 2,
+    );
+    final path = Path()..moveTo(start.dx, start.dy);
+    for (int i = 0; i < points.length; i++) {      
+      final next = points[(i + 1) % points.length];
+      final mid = Offset(
+        (points[i].dx + next.dx) / 2,
+        (points[i].dy + next.dy) / 2,
+      );
+      path.quadraticBezierTo(points[i].dx, points[i].dy, mid.dx, mid.dy);
     }
-    // Add a comfortable padding around the bounding box
-    const pad = 18.0;
-    final rect = Rect.fromLTRB(minX - pad, minY - pad, maxX + pad, maxY + pad);
-    return Path()..addOval(rect);
+    path.close();
+    return path;
   }
 
-  /// While drawing (not closed) — smooth catmull-rom path through captured points.
   Path _buildDrawingPath() {
     if (points.length < 2) return Path();
     final path = Path()..moveTo(points.first.dx, points.first.dy);
@@ -285,8 +317,7 @@ class LassoPainter extends CustomPainter {
         (points[i].dx + points[i + 1].dx) / 2,
         (points[i].dy + points[i + 1].dy) / 2,
       );
-      path.quadraticBezierTo(
-          points[i].dx, points[i].dy, mid.dx, mid.dy);
+      path.quadraticBezierTo(points[i].dx, points[i].dy, mid.dx, mid.dy);
     }
     path.lineTo(points.last.dx, points.last.dy);
     return path;
@@ -295,10 +326,7 @@ class LassoPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     if (points.length < 2) return;
-
-    final path = closed ? _buildEllipsePath() : _buildDrawingPath();
-
-    // Dashed stroke only — no fill, no dots
+    final path = closed ? _buildClosedPath() : _buildDrawingPath();
     final metrics = path.computeMetrics();
     const dashLen = 9.0;
     const gapLen = 5.0;
@@ -308,17 +336,20 @@ class LassoPainter extends CustomPainter {
       ..style = PaintingStyle.stroke
       ..strokeCap = StrokeCap.butt;
 
+    final period = dashLen + gapLen;
+    final phase = (marchOffset % 1.0) * period;
+
     for (final metric in metrics) {
-      double distance = 0.0;
-      bool draw = true;
+      // Start negative so the pattern slides in smoothly.
+      double distance = -phase;
+      bool draw = phase < dashLen;
+
       while (distance < metric.length) {
         final len = draw ? dashLen : gapLen;
-        if (draw) {
-          canvas.drawPath(
-            metric.extractPath(
-                distance, math.min(distance + len, metric.length)),
-            dashPaint,
-          );
+        final start = math.max(0.0, distance);
+        final end = math.min(distance + len, metric.length);
+        if (draw && end > start) {
+          canvas.drawPath(metric.extractPath(start, end), dashPaint);
         }
         distance += len;
         draw = !draw;
@@ -328,5 +359,6 @@ class LassoPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(LassoPainter old) =>
-      old.points != points || old.closed != closed;
+      old.points != points || old.closed != closed ||
+      old.marchOffset != marchOffset;
 }

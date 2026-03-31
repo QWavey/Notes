@@ -12,10 +12,11 @@ class CanvasPage extends StatefulWidget {
   const CanvasPage({super.key, required this.page});
 
   @override
-  State<CanvasPage> createState() => _CanvasPageState();
+  State<CanvasPage> createState() => CanvasPageState();
 }
 
-class _CanvasPageState extends State<CanvasPage>
+// Exposed so NotebookDetailScreen can trigger import/export via GlobalKey
+class CanvasPageState extends State<CanvasPage>
     with AutomaticKeepAliveClientMixin, TickerProviderStateMixin {
   late TabController _tabController;
   CanvasMode _mode = CanvasMode.draw;
@@ -31,6 +32,18 @@ class _CanvasPageState extends State<CanvasPage>
 
   @override
   bool get wantKeepAlive => true;
+
+  /// Called from NotebookDetailScreen to open the import/export dialog on the
+  /// currently-active draw canvas.
+  Future<void> triggerImport() =>
+      _drawKey.currentState?.showImportExportDialog() ?? Future.value();
+
+  Future<void> triggerClearPage() =>
+      _drawKey.currentState?.clearPageFromOutside() ?? Future.value();
+
+  Future<void> triggerRotatePage({required bool clockwise}) =>
+      _drawKey.currentState?.rotatePageContent90(clockwise: clockwise) ??
+      Future.value();
 
   @override
   void initState() {
@@ -75,11 +88,19 @@ class _CanvasPageState extends State<CanvasPage>
     return Column(
       children: [
         // ── Mode Tabs ────────────────────────────────────────────────────────
+        // GoodNotes-style indicator
         Material(
           elevation: 1,
           color: Colors.white,
           child: TabBar(
             controller: _tabController,
+            indicator: BoxDecoration(
+              borderRadius: BorderRadius.circular(8),
+              color: const Color(0xFF2E6DA4),
+            ),
+            indicatorSize: TabBarIndicatorSize.tab,
+            labelColor: Colors.white,
+            unselectedLabelColor: Colors.grey.shade600,
             tabs: [
               Tab(icon: const Icon(Icons.draw, size: 18), text: l10n.draw),
               Tab(

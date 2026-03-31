@@ -42,7 +42,46 @@ class StorageService {
 
   List<Notebook> getAllNotebooks() {
     final list = _notebookBox.values.toList();
+    final trashed = getTrashedNotebookIds();
+    list.removeWhere((n) => trashed.contains(n.id));
     list.sort((a, b) => a.createdAt.compareTo(b.createdAt));
+    return list;
+  }
+
+  Set<String> getTrashedNotebookIds() {
+    final raw = _textBox.get('__trashed_notebooks__');
+    if (raw == null || raw.isEmpty) return <String>{};
+    try {
+      final arr = (jsonDecode(raw) as List).cast<String>();
+      return arr.toSet();
+    } catch (_) {
+      return <String>{};
+    }
+  }
+
+  Future<void> _saveTrashedNotebookIds(Set<String> ids) async {
+    await _textBox.put(
+      '__trashed_notebooks__',
+      jsonEncode(ids.toList()),
+    );
+  }
+
+  Future<void> moveNotebookToTrash(String id) async {
+    final ids = getTrashedNotebookIds();
+    ids.add(id);
+    await _saveTrashedNotebookIds(ids);
+  }
+
+  Future<void> restoreNotebookFromTrash(String id) async {
+    final ids = getTrashedNotebookIds();
+    ids.remove(id);
+    await _saveTrashedNotebookIds(ids);
+  }
+
+  List<Notebook> getTrashedNotebooks() {
+    final ids = getTrashedNotebookIds();
+    final list = _notebookBox.values.where((n) => ids.contains(n.id)).toList();
+    list.sort((a, b) => b.createdAt.compareTo(a.createdAt));
     return list;
   }
 
@@ -51,6 +90,11 @@ class StorageService {
   }
 
   Future<void> deleteNotebook(String id) async {
+    // Ensure it disappears from trash metadata when hard-deleted.
+    final ids = getTrashedNotebookIds();
+    if (ids.remove(id)) {
+      await _saveTrashedNotebookIds(ids);
+    }
     final pages = getPagesForNotebook(id);
     for (final p in pages) {
       await deletePage(p.id);
@@ -119,5 +163,14 @@ class StorageService {
 
   Future<String> loadDocumentText(String pageId) async {
     return _textBox.get(pageId) ?? '';
+  }
+
+  // ─── Document rich-text span data ───────────────────────────────────────────────
+  Future<void> saveDocumentSpans(String pageId, String spansJson) async {
+    await _textBox.put(pageId + '_spans', spansJson);
+  }
+
+  Future<String?> loadDocumentSpans(String pageId) async {
+    return _textBox.get(pageId + '_spans');
   }
 }

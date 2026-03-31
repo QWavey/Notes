@@ -8,6 +8,7 @@ import '../services/storage_service.dart';
 import '../widgets/notebook_card.dart';
 import '../screens/notebook_detail_screen.dart';
 import '../screens/settings_screen.dart';
+import '../screens/trash_screen.dart';
 
 const _kColors = [
   0xFF2563EB, // blue
@@ -205,27 +206,26 @@ class _NotebooksScreenState extends State<NotebooksScreen> {
 
   // ─── Delete Confirm ───────────────────────────────────────────────────────
 
-  Future<void> _confirmDelete(Notebook nb) async {
+  Future<void> _moveToTrash(Notebook nb) async {
     final result = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: Text(AppLocalizations.of(ctx).delete),
-        content:
-            Text(AppLocalizations.of(ctx).deleteNotebookConfirm),
+        title: const Text('In den Papierkorb verschieben'),
+        content: Text('„${nb.name}“ in den Papierkorb verschieben?'),
         actions: [
           TextButton(
               onPressed: () => Navigator.pop(ctx, false),
               child: Text(AppLocalizations.of(ctx).cancel)),
           ElevatedButton(
-              style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+              style: ElevatedButton.styleFrom(backgroundColor: Colors.orange),
               onPressed: () => Navigator.pop(ctx, true),
-              child: Text(AppLocalizations.of(ctx).delete,
+              child: Text('Verschieben',
                   style: const TextStyle(color: Colors.white))),
         ],
       ),
     );
     if (result == true) {
-      await _storage.deleteNotebook(nb.id);
+      await _storage.moveNotebookToTrash(nb.id);
       _loadNotebooks();
     }
   }
@@ -305,6 +305,14 @@ class _NotebooksScreenState extends State<NotebooksScreen> {
         title: Text(l10n.notebooks),
         actions: [
           IconButton(
+            icon: const Icon(Icons.delete_outline),
+            tooltip: 'Papierkorb',
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const TrashScreen()),
+            ).then((_) => _loadNotebooks()),
+          ),
+          IconButton(
             icon: const Icon(Icons.settings),
             onPressed: () => Navigator.push(context,
                 MaterialPageRoute(builder: (_) => const SettingsScreen())),
@@ -330,7 +338,7 @@ class _NotebooksScreenState extends State<NotebooksScreen> {
                     pageCount: _pageCount(nb.id),
                     onTap: () => _openNotebook(nb),
                     onRename: () => _showRenameDialog(nb),
-                    onDelete: () => _confirmDelete(nb),
+                    onDelete: () => _moveToTrash(nb),
                     onSetPaperType: () => _showPaperTypeDialog(nb),
                     isQuickNote: nb.name.startsWith('Schnellnotiz'),
                   );

@@ -127,6 +127,9 @@ class ImageItem {
   double x, y, width, height;
   double rotation; // radians
   final String filePath;
+  /// When true the image is a locked full-page background (imported page/PDF).
+  /// It fills the whole canvas, cannot be moved or resized, and draws below ink.
+  final bool isPageBackground;
 
   ImageItem({
     required this.id,
@@ -136,6 +139,7 @@ class ImageItem {
     required this.height,
     this.rotation = 0.0,
     required this.filePath,
+    this.isPageBackground = false,
   });
 
   Offset get center => Offset(x + width / 2, y + height / 2);
@@ -148,6 +152,7 @@ class ImageItem {
         'height': height,
         'rotation': rotation,
         'filePath': filePath,
+        'isPageBackground': isPageBackground,
       };
 
   factory ImageItem.fromJson(Map<String, dynamic> j) => ImageItem(
@@ -158,6 +163,7 @@ class ImageItem {
         height: (j['height'] as num).toDouble(),
         rotation: (j['rotation'] as num? ?? 0.0).toDouble(),
         filePath: j['filePath'] as String,
+        isPageBackground: j['isPageBackground'] as bool? ?? false,
       );
 }
 
