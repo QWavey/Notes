@@ -1,5 +1,4 @@
 import 'dart:convert';
-import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import '../app_localizations.dart';
 import '../models/enums.dart';
@@ -43,7 +42,7 @@ class _DocRichController extends TextEditingController {
   // ── Adjust span positions when text is edited ───────────────────────────
 
   void _onTextChanged() {
-    final newText = this.text;
+    final newText = text;
     if (newText == _prevText) return;
     _adjustSpans(_prevText, newText);
   }
@@ -74,8 +73,11 @@ class _DocRichController extends TextEditingController {
         } else {
           // span overlaps deletion region → clip
           if (s > diffAt) s = diffAt;
-          if (e > delEnd) e = e + delta;
-          else e = diffAt;
+          if (e > delEnd) {
+            e = e + delta;
+          } else {
+            e = diffAt;
+          }
         }
       } else {
         // Insertion of [delta] chars at [diffAt]
@@ -325,7 +327,7 @@ class DocumentModeState extends State<DocumentMode> {
         color: Colors.white,
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withOpacity(0.1),
+            color: Colors.black.withValues(alpha: 0.1),
             blurRadius: 8,
             offset: const Offset(0, 2),
           ),
@@ -396,10 +398,12 @@ class DocumentModeState extends State<DocumentMode> {
               value: _pageSize,
               isDense: true,
               onChanged: (v) {
-                if (v != null) setState(() {
+                if (v != null) {
+                  setState(() {
                   _pageSize = v;
                   if (!_autoExpand) _customPageHeight = v.pixelHeight;
                 });
+                }
               },
               items: PageSize.values
                   .map((ps) => DropdownMenuItem(

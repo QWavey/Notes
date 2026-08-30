@@ -153,8 +153,11 @@ class ShapePainter extends CustomPainter {
       final radius = i.isEven ? outerR : innerR;
       final x = cx + radius * math.cos(angle);
       final y = cy + radius * math.sin(angle);
-      if (i == 0) path.moveTo(x, y);
-      else path.lineTo(x, y);
+      if (i == 0) {
+        path.moveTo(x, y);
+      } else {
+        path.lineTo(x, y);
+      }
     }
     path.close();
     canvas.drawPath(path, paint);
@@ -164,7 +167,7 @@ class ShapePainter extends CustomPainter {
     canvas.drawRect(
       r.inflate(4),
       Paint()
-        ..color = Colors.blue.withOpacity(0.5)
+        ..color = Colors.blue.withValues(alpha: 0.5)
         ..strokeWidth = 1.5
         ..style = PaintingStyle.stroke,
     );
@@ -254,7 +257,9 @@ List<Offset> shapeToPoints(ShapeItem shape, {int samples = 60}) {
         Offset(rect.left, rect.top + headH),
         Offset(cx, rect.top),
       ];
-      for (int i = 0; i < verts.length - 1; i++) addLine(verts[i], verts[i+1]);
+      for (int i = 0; i < verts.length - 1; i++) {
+        addLine(verts[i], verts[i+1]);
+      }
       break;
     case 'star':
       final cx2 = rect.left + rect.width / 2;
@@ -336,7 +341,7 @@ class LassoPainter extends CustomPainter {
       ..style = PaintingStyle.stroke
       ..strokeCap = StrokeCap.butt;
 
-    final period = dashLen + gapLen;
+    const period = dashLen + gapLen;
     final phase = (marchOffset % 1.0) * period;
 
     for (final metric in metrics) {

@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
 import '../models/notebook.dart';
-import '../models/enums.dart';
 import '../widgets/paper_painter.dart';
 
 class NotebookCard extends StatelessWidget {
@@ -183,7 +182,7 @@ class _CoverLinePainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     final paint = Paint()
-      ..color = Colors.white.withOpacity(0.12)
+      ..color = Colors.white.withValues(alpha: 0.12)
       ..strokeWidth = 1;
     const spacing = 12.0;
     for (double y = spacing; y < size.height; y += spacing) {

@@ -1,14 +1,14 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
-import 'dart:typed_data';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/foundation.dart';
 import 'dart:ui' as dart_ui;
 import 'package:flutter/rendering.dart';
 import 'image_helper_io.dart'
-    if (dart.library.html) 'image_helper_web.dart' as imgHelper;
+    if (dart.library.html) 'image_helper_web.dart' as img_helper;
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
@@ -36,7 +36,8 @@ class DrawSettings {
   static final DrawSettings instance = DrawSettings._();
   bool allowFingerDrawing = true; // default ON so finger drawing works out of the box
   bool enableShapeRecognition = false; // [BETA]
-  bool ultraLowLatency = false; // [BETA]
+  bool get ultraLowLatency => true; // ALWAYS ON
+  set ultraLowLatency(bool value) {}
   DrawCanvasSize canvasSize = DrawCanvasSize.a4; // default to A4
 }
 
@@ -85,6 +86,15 @@ class DrawMode extends StatefulWidget {
 class DrawModeState extends State<DrawMode> {
   final _storage = StorageService();
 
+  // ── Native low-latency canvas variables ──────────────────────────────────
+  MethodChannel? _nativeCanvasChannel;
+  int? _nativeViewId;
+  Color? _lastSentColor;
+  double? _lastSentWidth;
+  PenType? _lastSentType;
+  bool get _useNativeCanvas => !kIsWeb && Platform.isAndroid;
+
+
   // ── Zoom ──────────────────────────────────────────────────────────────────
   final TransformationController _xfCtrl = TransformationController();
 
@@ -98,21 +108,28 @@ class DrawModeState extends State<DrawMode> {
   bool _showSubMenu = false;
 
   // ── Toolbar position (draggable) ─────────────────────────────────────────
-  Alignment _toolbarAlignment = Alignment.topCenter;
-  double _toolbarOffsetX = 0.0;
+  // ignore: unused_field
+  final Alignment _toolbarAlignment = Alignment.topCenter;
+  // ignore: unused_field
+  final double _toolbarOffsetX = 0.0;
 
   // ── Fullscreen ────────────────────────────────────────────────────────────
   bool _isFullscreen = false;
 
   // ── Color palette corner ──────────────────────────────────────────────────
-  Alignment _paletteCorner = Alignment.bottomRight;
-  Offset _paletteDragBaseOffset = Offset.zero;
+  // ignore: unused_field
+  final Alignment _paletteCorner = Alignment.bottomRight;
+  // ignore: unused_field
+  final Offset _paletteDragBaseOffset = Offset.zero;
 
   // ── Active text formatting overlay ────────────────────────────────────────
+  // ignore: unused_field
   String? _focusedTextBoxId;
 
   // ── Straight-line snap ────────────────────────────────────────────────────
-  bool _snapToLine = false;
+  // ignore: unused_field
+  final bool _snapToLine = false;
+  // ignore: unused_field
   Offset? _snapLineStart;
   Timer? _snapLineTimer;
 
@@ -171,6 +188,7 @@ class DrawModeState extends State<DrawMode> {
   Set<int> _resizeStrokeIdxs = {};
   // Scale handle drag
   Offset? _resizeHandleStart;
+  // ignore: unused_field
   double _resizeBaseScale = 1.0;
   Rect? _resizeSelectionRect; // bounding rect of selection in canvas space
   Map<String, Rect> _resizeBaseRects = {}; // original rects per id
@@ -227,13 +245,16 @@ class DrawModeState extends State<DrawMode> {
   final Map<String, Size> _imgScaleStart = {};
 
   // ── Shape recognition BETA ───────────────────────────────────────────────
+  // ignore: unused_field
   DateTime? _penHoldStart;
   Timer? _shapeRecTimer;
   Offset? _lastShapeRecPos; // jitter filter for Android stylus events
 
   // ── Page-fit tracking ──────────────────────────────────────────────────
-  bool _pageFitDone = false;
-  DrawCanvasSize _activeCanvasSize = DrawCanvasSize.a4;
+  // ignore: unused_field
+  final bool _pageFitDone = false;
+  // ignore: unused_field
+  final DrawCanvasSize _activeCanvasSize = DrawCanvasSize.a4;
 
   // ── Circle-to-lasso ───────────────────────────────────────────────────────
   bool _circleLassoReady = false;
@@ -278,12 +299,90 @@ class DrawModeState extends State<DrawMode> {
     for (final imgId in _imgScaleStart.keys.toList()) { _imgScaleStart.remove(imgId); }
     _inkRepaintNotifier.dispose();
     _xfCtrl.dispose();
-    for (final c in _teControllers.values) c.dispose();
-    for (final f in _focusNodes.values) f.dispose();
-    for (final c in _cellControllers.values) c.dispose();
-    for (final f in _cellFocusNodes.values) f.dispose();
+    for (final c in _teControllers.values) {
+      c.dispose();
+    }
+    for (final f in _focusNodes.values) {
+      f.dispose();
+    }
+    for (final c in _cellControllers.values) {
+      c.dispose();
+    }
+    for (final f in _cellFocusNodes.values) {
+      f.dispose();
+    }
+    _nativeCanvasChannel?.setMethodCallHandler(null);
     super.dispose();
   }
+
+  // ── Native low-latency canvas helper methods ──────────────────────────────
+  void _onPlatformViewCreated(int id) {
+    _nativeViewId = id;
+    debugPrint('Native low-latency canvas view created: $_nativeViewId');
+    _nativeCanvasChannel = MethodChannel('com.example.notes/low_latency_canvas_$id');
+    _nativeCanvasChannel!.setMethodCallHandler((call) async {
+      if (call.method == 'onStrokeFinished') {
+        final strokeMap = call.arguments as Map<dynamic, dynamic>;
+        final colorVal = strokeMap['color'] as int;
+        final widthVal = (strokeMap['width'] as num).toDouble();
+        final penTypeIndex = strokeMap['penType'] as int;
+        final pointsList = strokeMap['points'] as List<dynamic>;
+        
+        final points = pointsList.map((p) {
+          final pointMap = p as Map<dynamic, dynamic>;
+          return Offset((pointMap['x'] as num).toDouble(), (pointMap['y'] as num).toDouble());
+        }).toList();
+        
+        final stroke = _Stroke(
+          color: Color(colorVal),
+          width: widthVal,
+          penType: PenType.values[penTypeIndex],
+          points: points,
+        );
+        
+        _pushUndo();
+        setState(() {
+          _strokes.add(stroke);
+        });
+        widget.onDirty();
+      }
+    });
+
+    _syncStrokesToNative();
+    _syncPenSettingsToNative();
+  }
+
+  Future<void> _syncStrokesToNative() async {
+    if (!_useNativeCanvas || _nativeCanvasChannel == null) return;
+    try {
+      final strokesJson = _strokes.map((s) => s.toJson()).toList();
+      await _nativeCanvasChannel!.invokeMethod('setStrokes', strokesJson);
+    } catch (e) {
+      debugPrint('Failed to sync strokes to native: $e');
+    }
+  }
+
+  Future<void> _syncPenSettingsToNative() async {
+    if (!_useNativeCanvas || _nativeCanvasChannel == null) return;
+    if (_lastSentColor == _color &&
+        _lastSentWidth == _penWidth &&
+        _lastSentType == _penType) {
+      return;
+    }
+    _lastSentColor = _color;
+    _lastSentWidth = _penWidth;
+    _lastSentType = _penType;
+    try {
+      await _nativeCanvasChannel!.invokeMethod('setPenSettings', {
+        'color': _color.toARGB32(),
+        'width': _penWidth,
+        'penType': _penType.index,
+      });
+    } catch (e) {
+      debugPrint('Failed to sync pen settings to native: $e');
+    }
+  }
+
 
   // ─────────────────────────────────────────────────────────────────────────
   // Load / Save
@@ -311,6 +410,7 @@ class DrawModeState extends State<DrawMode> {
     });
     _initTextControllers();
     _initCellControllers();
+    _syncStrokesToNative();
   }
 
   Future<void> saveAll() async {
@@ -405,6 +505,7 @@ class DrawModeState extends State<DrawMode> {
       _syncControllers();
     }
     widget.onDirty();
+    _syncStrokesToNative();
   }
 
   void _redo() {
@@ -421,6 +522,7 @@ class DrawModeState extends State<DrawMode> {
       _syncControllers();
     }
     widget.onDirty();
+    _syncStrokesToNative();
   }
 
   _Snapshot _currentSnapshot() => _Snapshot(
@@ -550,8 +652,9 @@ class DrawModeState extends State<DrawMode> {
       final hit = stroke.points.any((p) => (p - pos).distance <= r) ||
           () {
             for (int i = 0; i < stroke.points.length - 1; i++) {
-              if (_segInCircle(stroke.points[i], stroke.points[i + 1], pos, r))
+              if (_segInCircle(stroke.points[i], stroke.points[i + 1], pos, r)) {
                 return true;
+              }
             }
             return false;
           }();
@@ -744,7 +847,9 @@ class DrawModeState extends State<DrawMode> {
     final d3 = _cross(b - a, c - a);
     final d4 = _cross(b - a, d - a);
     if (((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) &&
-        ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))) return true;
+        ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))) {
+      return true;
+    }
     return false;
   }
 
@@ -1305,7 +1410,9 @@ class DrawModeState extends State<DrawMode> {
       expand(t.x, t.y); expand(t.x + t.totalWidth, t.y + t.totalHeight);
     }
     for (final idx in strokeIdxs) {
-      for (final p in _strokes[idx].points) expand(p.dx, p.dy);
+      for (final p in _strokes[idx].points) {
+        expand(p.dx, p.dy);
+      }
     }
     if (minX == null) return [];
     const pad = 12.0;
@@ -1493,7 +1600,7 @@ class DrawModeState extends State<DrawMode> {
             _shapes.add(ShapeItem(
               id: _uuid.v4(), shapeType: 'circle',
               x: minX, y: minY, width: w, height: h,
-              colorValue: stroke.color.value, strokeWidth: stroke.width,
+              colorValue: stroke.color.toARGB32(), strokeWidth: stroke.width,
             ));
             _currentStroke = null;
           });
@@ -1504,7 +1611,7 @@ class DrawModeState extends State<DrawMode> {
             _shapes.add(ShapeItem(
               id: _uuid.v4(), shapeType: shapeName,
               x: minX, y: minY, width: w, height: h,
-              colorValue: stroke.color.value, strokeWidth: stroke.width,
+              colorValue: stroke.color.toARGB32(), strokeWidth: stroke.width,
             ));
             _currentStroke = null;
           });
@@ -1524,6 +1631,7 @@ class DrawModeState extends State<DrawMode> {
   }
 
   void _onPointerDown(PointerDownEvent e) {
+    if (_useNativeCanvas && _tool == DrawTool.pen) return;
     if (_ignoredKind(e.kind)) return;
 
     if (e.kind == PointerDeviceKind.stylus && e.buttons == 2) {
@@ -1554,7 +1662,9 @@ class DrawModeState extends State<DrawMode> {
       } else {
         _clearLasso();
         if (_tool != DrawTool.lasso && _tool != DrawTool.pen &&
-            _tool != DrawTool.eraser && _tool != DrawTool.shape) return;
+            _tool != DrawTool.eraser && _tool != DrawTool.shape) {
+          return;
+        }
       }
     }
 
@@ -1691,6 +1801,7 @@ class DrawModeState extends State<DrawMode> {
   }
 
   void _onPointerMove(PointerMoveEvent e) {
+    if (_useNativeCanvas && _tool == DrawTool.pen) return;
     if (_ignoredKind(e.kind)) return;
     final pos = _toCanvas(e.localPosition);
 
@@ -1817,6 +1928,7 @@ class DrawModeState extends State<DrawMode> {
   }
 
   void _onPointerUp(PointerUpEvent e) {
+    if (_useNativeCanvas && _tool == DrawTool.pen) return;
     if (_ignoredKind(e.kind)) return;
 
     if (_lassoReady && _lassoMoveStart != null) {
@@ -1919,7 +2031,7 @@ class DrawModeState extends State<DrawMode> {
       id: ghost ? '_ghost_' : _uuid.v4(),
       shapeType: typeName,
       x: x, y: y, width: w, height: h,
-      colorValue: _color.value,
+      colorValue: _color.toARGB32(),
       strokeWidth: _penWidth,
     );
   }
@@ -2063,7 +2175,9 @@ class DrawModeState extends State<DrawMode> {
     if (handle == null ||
         baseRect == null ||
         startPos == null ||
-        selectedId == null) return;
+        selectedId == null) {
+      return;
+    }
 
     final idx = _shapes.indexWhere((s) => s.id == selectedId);
     if (idx < 0) return;
@@ -2121,7 +2235,7 @@ class DrawModeState extends State<DrawMode> {
 
   void _placeTextBox(Offset pos) {
     final id = _uuid.v4();
-    final tb = TextBoxItem(id: id, x: pos.dx, y: pos.dy, colorValue: _color.value);
+    final tb = TextBoxItem(id: id, x: pos.dx, y: pos.dy, colorValue: _color.toARGB32());
     _pushUndo();
     final ctrl = TextEditingController();
     final focus = FocusNode();
@@ -2413,8 +2527,10 @@ class DrawModeState extends State<DrawMode> {
       }
       await doc.dispose();
     } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('PDF Import fehlgeschlagen: $e')));
+      }
     }
   }
 
@@ -2477,10 +2593,18 @@ class DrawModeState extends State<DrawMode> {
             onPressed: () {
               Navigator.pop(ctx);
               _pushUndo();
-              for (final c in _teControllers.values) c.dispose();
-              for (final f in _focusNodes.values) f.dispose();
-              for (final c in _cellControllers.values) c.dispose();
-              for (final f in _cellFocusNodes.values) f.dispose();
+              for (final c in _teControllers.values) {
+                c.dispose();
+              }
+              for (final f in _focusNodes.values) {
+                f.dispose();
+              }
+              for (final c in _cellControllers.values) {
+                c.dispose();
+              }
+              for (final f in _cellFocusNodes.values) {
+                f.dispose();
+              }
               setState(() {
                 _strokes.clear();
                 _shapes.clear();
@@ -2493,6 +2617,7 @@ class DrawModeState extends State<DrawMode> {
                 _cellFocusNodes.clear();
               });
               widget.onDirty();
+              _syncStrokesToNative();
             },
             child: const Text('L\u00f6schen', style: TextStyle(color: Colors.white)),
           ),
@@ -2501,6 +2626,7 @@ class DrawModeState extends State<DrawMode> {
     );
   }
 
+  // ignore: unused_element
   Future<void> _importImage() async {
     try {
       final xfile = await ImagePicker().pickImage(source: ImageSource.gallery);
@@ -2514,6 +2640,7 @@ class DrawModeState extends State<DrawMode> {
     }
   }
 
+  // ignore: unused_element
   Future<void> _takePhoto() async {
     try {
       final xfile = await ImagePicker().pickImage(source: ImageSource.camera);
@@ -2532,9 +2659,14 @@ class DrawModeState extends State<DrawMode> {
     }
   }
 
+  // ignore: unused_element
   Future<void> _exportShare() async {
     try {
-      await Share.share('Exportiert aus Notes \u2013 ${widget.page.name}');
+      await SharePlus.instance.share(
+        ShareParams(
+          text: 'Exportiert aus Notes \u2013 ${widget.page.name}',
+        ),
+      );
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context)
@@ -2559,9 +2691,11 @@ class DrawModeState extends State<DrawMode> {
       final file = File('${tmpDir.path}/quickshare_${widget.page.name}.png');
       await file.writeAsBytes(bytes);
       if (!mounted) return;
-      await Share.shareXFiles(
-        [XFile(file.path, name: '${widget.page.name}.png', mimeType: 'image/png')],
-        text: 'Notiz: ${widget.page.name}',
+      await SharePlus.instance.share(
+        ShareParams(
+          files: [XFile(file.path, name: '${widget.page.name}.png', mimeType: 'image/png')],
+          text: 'Notiz: ${widget.page.name}',
+        ),
       );
     } catch (e) {
       if (mounted) {
@@ -2606,6 +2740,7 @@ class DrawModeState extends State<DrawMode> {
     });
     await saveAll();
     widget.onDirty();
+    _syncStrokesToNative();
   }
 
   Future<void> rotatePageContent90({required bool clockwise}) async {
@@ -2700,6 +2835,7 @@ class DrawModeState extends State<DrawMode> {
 
     await saveAll();
     widget.onDirty();
+    _syncStrokesToNative();
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -2735,16 +2871,6 @@ class DrawModeState extends State<DrawMode> {
                     setState(() {});
                   },
                 ),
-                const Divider(),
-                SwitchListTile(
-                  title: const Text('[BETA] Ultra-minimierte Stiftverz\u00f6gerung'),
-                  subtitle: const Text('Reduziert Verz\u00f6gerung bei schnellem Zeichnen'),
-                  value: DrawSettings.instance.ultraLowLatency,
-                  onChanged: (v) {
-                    setLocal(() => DrawSettings.instance.ultraLowLatency = v);
-                    setState(() {});
-                  },
-                ),
               ],
             ),
           ),
@@ -2762,6 +2888,9 @@ class DrawModeState extends State<DrawMode> {
 
   @override
   Widget build(BuildContext context) {
+    if (_useNativeCanvas) {
+      _syncPenSettingsToNative();
+    }
     final l10n = AppLocalizations.of(context);
 
     return Column(
@@ -2865,18 +2994,49 @@ class DrawModeState extends State<DrawMode> {
 
                           // ── Ink strokes (above images) ───────────────────
                           Positioned.fill(
-                            child: IgnorePointer(
-                              child: ListenableBuilder(
-                                listenable: _inkRepaintNotifier,
-                                builder: (_, __) => CustomPaint(
-                                  painter: _InkPainter(
-                                    strokes: _strokes,
-                                    useHighQuality:
-                                        !DrawSettings.instance.ultraLowLatency,
+                            child: _useNativeCanvas
+                                ? IgnorePointer(
+                                    ignoring: _tool != DrawTool.pen,
+                                    child: PlatformViewLink(
+                                      viewType: 'com.example.notes/low_latency_canvas',
+                                      surfaceFactory: (context, controller) {
+                                        return AndroidViewSurface(
+                                          controller: controller as AndroidViewController,
+                                          gestureRecognizers: const <Factory<OneSequenceGestureRecognizer>>{},
+                                          hitTestBehavior: PlatformViewHitTestBehavior.opaque,
+                                        );
+                                      },
+                                      onCreatePlatformView: (params) {
+                                        return PlatformViewsService.initExpensiveAndroidView(
+                                          id: params.id,
+                                          viewType: 'com.example.notes/low_latency_canvas',
+                                          layoutDirection: TextDirection.ltr,
+                                          creationParams: const {},
+                                          creationParamsCodec: const StandardMessageCodec(),
+                                          onFocus: () {
+                                            params.onFocusChanged(true);
+                                          },
+                                        )
+                                          ..addOnPlatformViewCreatedListener((id) {
+                                            params.onPlatformViewCreated(id);
+                                            _onPlatformViewCreated(id);
+                                          })
+                                          ..create();
+                                      },
+                                    ),
+                                  )
+                                : IgnorePointer(
+                                    child: ListenableBuilder(
+                                      listenable: _inkRepaintNotifier,
+                                      builder: (_, __) => CustomPaint(
+                                        painter: _InkPainter(
+                                          strokes: _strokes,
+                                          useHighQuality:
+                                              !DrawSettings.instance.ultraLowLatency,
+                                        ),
+                                      ),
+                                    ),
                                   ),
-                                ),
-                              ),
-                            ),
                           ),
 
                           // ── Shapes ───────────────────────────────────────
@@ -2970,7 +3130,7 @@ class DrawModeState extends State<DrawMode> {
                     child: Container(
                       width: 40, height: 40,
                       decoration: BoxDecoration(
-                        color: Colors.green.shade400.withOpacity(0.9),
+                        color: Colors.green.shade400.withValues(alpha: 0.9),
                         shape: BoxShape.circle,
                         boxShadow: [BoxShadow(color: Colors.green.shade200, blurRadius: 10, spreadRadius: 2)],
                       ),
@@ -3025,10 +3185,15 @@ class DrawModeState extends State<DrawMode> {
                         final vx = d.velocity.pixelsPerSecond.dx;
                         final vy = d.velocity.pixelsPerSecond.dy;
                         setState(() {
-                          if (vx < 0 && vy < 0) _paletteCornerIdx = 0;
-                          else if (vx >= 0 && vy < 0) _paletteCornerIdx = 1;
-                          else if (vx < 0 && vy >= 0) _paletteCornerIdx = 2;
-                          else _paletteCornerIdx = 3;
+                          if (vx < 0 && vy < 0) {
+                            _paletteCornerIdx = 0;
+                          } else if (vx >= 0 && vy < 0) {
+                            _paletteCornerIdx = 1;
+                          } else if (vx < 0 && vy >= 0) {
+                            _paletteCornerIdx = 2;
+                          } else {
+                            _paletteCornerIdx = 3;
+                          }
                         });
                       },
                       child: FloatingColorBubble(
@@ -3057,7 +3222,7 @@ class DrawModeState extends State<DrawMode> {
 
   String _pageInfo() {
     final d = widget.page.createdAt;
-    final pad = (int n) => n.toString().padLeft(2, '0');
+    String pad(int n) => n.toString().padLeft(2, '0');
     return 'Seite ${widget.page.order + 1}  \u2022  ${pad(d.day)}.${pad(d.month)}.${d.year}';
   }
 
@@ -3133,7 +3298,7 @@ class DrawModeState extends State<DrawMode> {
           left: img.x, top: img.y, width: img.width, height: img.height,
           child: Transform.rotate(
             angle: img.rotation,
-            child: IgnorePointer(child: imgHelper.buildFileImage(img.filePath)),
+            child: IgnorePointer(child: img_helper.buildFileImage(img.filePath)),
           ),
         );
       }
@@ -3167,7 +3332,7 @@ class DrawModeState extends State<DrawMode> {
             child: Stack(
               clipBehavior: Clip.none,
               children: [
-                Positioned.fill(child: imgHelper.buildFileImage(img.filePath)),
+                Positioned.fill(child: img_helper.buildFileImage(img.filePath)),
                 if (isSelected)
                   Positioned.fill(
                     child: IgnorePointer(
@@ -3185,7 +3350,7 @@ class DrawModeState extends State<DrawMode> {
                     child: Container(
                       width: 26, height: 26,
                       decoration: BoxDecoration(
-                        color: Colors.black.withOpacity(0.5),
+                        color: Colors.black.withValues(alpha: 0.5),
                         shape: BoxShape.circle,
                       ),
                       child: const Icon(Icons.more_vert, size: 16, color: Colors.white),
@@ -3217,7 +3382,7 @@ class DrawModeState extends State<DrawMode> {
                     child: Container(
                       width: 28, height: 28,
                       decoration: BoxDecoration(
-                        color: Colors.blue.withOpacity(0.85),
+                        color: Colors.blue.withValues(alpha: 0.85),
                         borderRadius: const BorderRadius.only(
                           topLeft: Radius.circular(6),
                         ),
@@ -3252,7 +3417,7 @@ class DrawModeState extends State<DrawMode> {
                     child: Container(
                       width: 26, height: 26,
                       decoration: BoxDecoration(
-                        color: Colors.orange.withOpacity(0.85),
+                        color: Colors.orange.withValues(alpha: 0.85),
                         shape: BoxShape.circle,
                       ),
                       child: const Icon(Icons.rotate_right, size: 15, color: Colors.white),
@@ -3336,17 +3501,17 @@ class DrawModeState extends State<DrawMode> {
               Container(
                 padding: const EdgeInsets.all(6),
                 decoration: BoxDecoration(
-                  color: Colors.white.withOpacity(0.92),
+                  color: Colors.white.withValues(alpha: 0.92),
                   border: Border.all(
                     color: isFocused ? Colors.blue.shade600
                         : inLasso ? Colors.blue
-                        : _tool == DrawTool.move ? Colors.blue.withOpacity(0.5)
+                        : _tool == DrawTool.move ? Colors.blue.withValues(alpha: 0.5)
                         : Colors.grey.shade300,
                     width: isFocused || inLasso ? 2 : 1,
                   ),
                   borderRadius: BorderRadius.circular(6),
                   boxShadow: isFocused ? [
-                    BoxShadow(color: Colors.blue.withOpacity(0.15), blurRadius: 6)
+                    BoxShadow(color: Colors.blue.withValues(alpha: 0.15), blurRadius: 6)
                   ] : null,
                 ),
                 child: TextField(
@@ -3484,7 +3649,7 @@ class DrawModeState extends State<DrawMode> {
                 decoration: BoxDecoration(
                   border: Border.all(
                     color: inLasso ? Colors.blue
-                        : isSel ? Colors.blue.withOpacity(0.7)
+                        : isSel ? Colors.blue.withValues(alpha: 0.7)
                         : Color(tbl.colorValue),
                     width: inLasso || isSel ? 2 : 1,
                   ),
@@ -3561,7 +3726,9 @@ class DrawModeState extends State<DrawMode> {
         child: _tableBtn(Icons.add, 'Sp.', () {
           setState(() {
             tbl.cols++;
-            for (final row in tbl.cells) row.add('');
+            for (final row in tbl.cells) {
+              row.add('');
+            }
           });
           _initCellControllers();
           widget.onDirty();
@@ -3632,7 +3799,7 @@ class DrawModeState extends State<DrawMode> {
           color: Colors.white,
           border: Border(bottom: BorderSide(color: Colors.grey.shade200)),
           boxShadow: _toolbarDragActive
-              ? [BoxShadow(color: Colors.blue.withOpacity(0.2), blurRadius: 8)]
+              ? [BoxShadow(color: Colors.blue.withValues(alpha: 0.2), blurRadius: 8)]
               : null,
         ),
         child: SingleChildScrollView(
@@ -4011,7 +4178,7 @@ class DrawModeState extends State<DrawMode> {
                     DrawSettings.instance.enableShapeRecognition = v;
                   });
                 },
-                activeColor: const Color(0xFF2E6DA4),
+                activeThumbColor: const Color(0xFF2E6DA4),
               ),
             ],
           ),
@@ -4049,7 +4216,7 @@ class DrawModeState extends State<DrawMode> {
       child: Row(
         children: [
           SizedBox(
-            width: 200,
+            width: 130,
             child: Text(
               label,
               style: TextStyle(fontSize: 10, color: Colors.grey.shade500, letterSpacing: 0.8),
@@ -4061,7 +4228,7 @@ class DrawModeState extends State<DrawMode> {
                 activeTrackColor: const Color(0xFF5BAEF5),
                 inactiveTrackColor: Colors.grey.shade700,
                 thumbColor: const Color(0xFF5BAEF5),
-                overlayColor: Colors.blue.withOpacity(0.2),
+                overlayColor: Colors.blue.withValues(alpha: 0.2),
                 thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 7),
                 trackHeight: 3,
               ),
@@ -4151,6 +4318,7 @@ class DrawModeState extends State<DrawMode> {
     );
   }
 
+  // ignore: unused_element
   Widget _chip(String label, bool active, VoidCallback onTap) =>
       GestureDetector(
         onTap: onTap,
@@ -4195,7 +4363,7 @@ class _Stroke {
       );
 
   Map<String, dynamic> toJson() => {
-        'color': color.value,
+        'color': color.toARGB32(),
         'width': width,
         'penType': penType.index,
         'points': points.map((p) => {'x': p.dx, 'y': p.dy}).toList(),
@@ -4225,7 +4393,9 @@ class _InkPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    for (final s in strokes) _paintStroke(canvas, s);
+    for (final s in strokes) {
+      _paintStroke(canvas, s);
+    }
   }
 
   void _paintStroke(Canvas canvas, _Stroke s) {
@@ -4253,7 +4423,9 @@ class _InkPainter extends CustomPainter {
       ..isAntiAlias = true;
     if (!useHighQuality) {
       final path = Path()..moveTo(s.points.first.dx, s.points.first.dy);
-      for (int i = 1; i < s.points.length; i++) path.lineTo(s.points[i].dx, s.points[i].dy);
+      for (int i = 1; i < s.points.length; i++) {
+        path.lineTo(s.points[i].dx, s.points[i].dy);
+      }
       canvas.drawPath(path, paint);
       return;
     }
@@ -4275,7 +4447,7 @@ class _InkPainter extends CustomPainter {
       final envelope = math.sin(math.pi * t); // 0→1→0
       final w = s.width * (0.35 + 0.75 * envelope);
       final paint = Paint()
-        ..color = s.color.withOpacity(0.82 + 0.18 * envelope)
+        ..color = s.color.withValues(alpha: 0.82 + 0.18 * envelope)
         ..strokeWidth = w.clamp(0.5, s.width * 1.8)
         ..strokeCap = StrokeCap.round
         ..style = PaintingStyle.stroke
@@ -4294,7 +4466,7 @@ class _InkPainter extends CustomPainter {
       final spd = speeds[i] / maxSpd;
       final w = s.width * (1.8 - spd * 1.2);
       final paint = Paint()
-        ..color = s.color.withOpacity((0.7 + spd * 0.3).clamp(0.0, 1.0))
+        ..color = s.color.withValues(alpha: (0.7 + spd * 0.3).clamp(0.0, 1.0))
         ..strokeWidth = w.clamp(0.3, s.width * 2.8)
         ..strokeCap = StrokeCap.round
         ..style = PaintingStyle.stroke
@@ -4319,11 +4491,11 @@ class _EraserCursorPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     canvas.drawCircle(position, radius,
-        Paint()..color = Colors.white.withOpacity(0.01)..style = PaintingStyle.fill);
+        Paint()..color = Colors.white.withValues(alpha: 0.01)..style = PaintingStyle.fill);
     canvas.drawCircle(position, radius,
-        Paint()..color = Colors.black.withOpacity(0.7)..strokeWidth = 1.5..style = PaintingStyle.stroke);
+        Paint()..color = Colors.black.withValues(alpha: 0.7)..strokeWidth = 1.5..style = PaintingStyle.stroke);
     canvas.drawCircle(position, radius - 1,
-        Paint()..color = Colors.grey.withOpacity(0.15)..strokeWidth = 1.0..style = PaintingStyle.stroke);
+        Paint()..color = Colors.grey.withValues(alpha: 0.15)..strokeWidth = 1.0..style = PaintingStyle.stroke);
   }
 
   @override
@@ -4407,6 +4579,7 @@ class _ResizeLassoPainter extends CustomPainter {
 // ---------------------------------------------------------------------------
 
 class _InkRepaintNotifier extends ChangeNotifier {
+  @override
   void notifyListeners() => super.notifyListeners();
 }
 

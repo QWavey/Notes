@@ -6,7 +6,7 @@ plugins {
 
 android {
     namespace = "com.example.notes"
-    compileSdk = flutter.compileSdkVersion
+    compileSdk = 36
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
@@ -37,3 +37,9 @@ android {
 flutter {
     source = "../.."
 }
+
+dependencies {
+    implementation("androidx.graphics:graphics-core:1.0.4")
+    implementation("androidx.input:input-motionprediction:1.0.0")
+}
+

@@ -167,10 +167,10 @@ class StorageService {
 
   // ─── Document rich-text span data ───────────────────────────────────────────────
   Future<void> saveDocumentSpans(String pageId, String spansJson) async {
-    await _textBox.put(pageId + '_spans', spansJson);
+    await _textBox.put('${pageId}_spans', spansJson);
   }
 
   Future<String?> loadDocumentSpans(String pageId) async {
-    return _textBox.get(pageId + '_spans');
+    return _textBox.get('${pageId}_spans');
   }
 }

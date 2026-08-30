@@ -68,7 +68,7 @@ class _NotebooksScreenState extends State<NotebooksScreen> {
 
   Future<void> _createQuickNote() async {
     final now = DateTime.now();
-    final pad2 = (int n) => n.toString().padLeft(2, '0');
+    String pad2(int n) => n.toString().padLeft(2, '0');
     final title =
         'Schnellnotiz ${pad2(now.day)}.${pad2(now.month)}.${now.year} '
         '${pad2(now.hour)}:${pad2(now.minute)}';
@@ -241,16 +241,18 @@ class _NotebooksScreenState extends State<NotebooksScreen> {
           title: Text(AppLocalizations.of(ctx).defaultPaperType),
           content: SizedBox(
             width: 300,
-            child: ListView(
-              shrinkWrap: true,
-              children: PaperType.values
-                  .map((pt) => RadioListTile<PaperType>(
-                        title: Text(pt.label),
-                        value: pt,
-                        groupValue: selected,
-                        onChanged: (v) => setLocal(() => selected = v!),
-                      ))
-                  .toList(),
+            child: RadioGroup<PaperType>(
+              groupValue: selected,
+              onChanged: (v) => setLocal(() => selected = v!),
+              child: ListView(
+                shrinkWrap: true,
+                children: PaperType.values
+                    .map((pt) => RadioListTile<PaperType>(
+                          title: Text(pt.label),
+                          value: pt,
+                        ))
+                    .toList(),
+              ),
             ),
           ),
           actions: [

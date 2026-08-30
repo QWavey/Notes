@@ -12,7 +12,6 @@ import '../models/canvas_item.dart';
 import '../services/storage_service.dart';
 import '../widgets/paper_painter.dart';
 import '../canvas/canvas_page.dart';
-import 'package:uuid/uuid.dart';
 import '../canvas/draw_mode.dart';
 import 'package:notes/main.dart';
 
@@ -190,10 +189,10 @@ class _PageItemsPainter extends CustomPainter {
     for (final img in canvasData.images) {
       final r = Rect.fromLTWH(img.x, img.y, img.width, img.height);
       final bg = Paint()
-        ..color = Colors.grey.withOpacity(0.12)
+        ..color = Colors.grey.withValues(alpha: 0.12)
         ..style = PaintingStyle.fill;
       final border = Paint()
-        ..color = Colors.grey.withOpacity(0.55)
+        ..color = Colors.grey.withValues(alpha: 0.55)
         ..strokeWidth = 1.0
         ..style = PaintingStyle.stroke;
       canvas.drawRect(r, bg);
@@ -204,7 +203,7 @@ class _PageItemsPainter extends CustomPainter {
     for (final tbl in canvasData.tables) {
       final r = Rect.fromLTWH(tbl.x, tbl.y, tbl.totalWidth, tbl.totalHeight);
       final border = Paint()
-        ..color = Colors.blueGrey.withOpacity(0.4)
+        ..color = Colors.blueGrey.withValues(alpha: 0.4)
         ..strokeWidth = 1.0
         ..style = PaintingStyle.stroke;
       canvas.drawRect(r, border);
@@ -560,10 +559,7 @@ class _NotebookDetailScreenState extends State<NotebookDetailScreen> {
                   child: Text('Page navigation',
                       style: const TextStyle(fontWeight: FontWeight.bold)),
                 ),
-                RadioListTile<PageNavigationMode>(
-                  title: const Text('Swipe left/right'),
-                  subtitle: const Text('(2 fingers when finger drawing is on)'),
-                  value: PageNavigationMode.swipeHorizontal,
+                RadioGroup<PageNavigationMode>(
                   groupValue: AppSettings.instance.pageNavMode,
                   onChanged: (v) {
                     if (v != null) {
@@ -571,17 +567,19 @@ class _NotebookDetailScreenState extends State<NotebookDetailScreen> {
                       setState(() {});
                     }
                   },
-                ),
-                RadioListTile<PageNavigationMode>(
-                  title: const Text('Scroll up/down'),
-                  value: PageNavigationMode.scrollVertical,
-                  groupValue: AppSettings.instance.pageNavMode,
-                  onChanged: (v) {
-                    if (v != null) {
-                      setLocal(() => AppSettings.instance.pageNavMode = v);
-                      setState(() {});
-                    }
-                  },
+                  child: Column(
+                    children: [
+                      RadioListTile<PageNavigationMode>(
+                        title: const Text('Swipe left/right'),
+                        subtitle: const Text('(2 fingers when finger drawing is on)'),
+                        value: PageNavigationMode.swipeHorizontal,
+                      ),
+                      RadioListTile<PageNavigationMode>(
+                        title: const Text('Scroll up/down'),
+                        value: PageNavigationMode.scrollVertical,
+                      ),
+                    ],
+                  ),
                 ),
                 const Divider(),
                 SwitchListTile(
@@ -590,18 +588,6 @@ class _NotebookDetailScreenState extends State<NotebookDetailScreen> {
                   value: DrawSettings.instance.enableShapeRecognition,
                   onChanged: (v) {
                     setLocal(() => DrawSettings.instance.enableShapeRecognition = v);
-                    setState(() {});
-                  },
-                ),
-                const Divider(),
-                SwitchListTile(
-                  title: const Text('[BETA] Ultra-low pen latency'),
-                  subtitle: const Text(
-                      'Reduces lag when drawing fast\n'
-                      'Note: on Android APK the gain is smaller than in debug mode.'),
-                  value: DrawSettings.instance.ultraLowLatency,
-                  onChanged: (v) {
-                    setLocal(() => DrawSettings.instance.ultraLowLatency = v);
                     setState(() {});
                   },
                 ),
@@ -1024,7 +1010,7 @@ class _NotebookDetailScreenState extends State<NotebookDetailScreen> {
               trailing: Switch(
                 value: false,
                 onChanged: null,
-                activeColor: const Color(0xFF2E6DA4),
+                activeThumbColor: const Color(0xFF2E6DA4),
               ),
             ),
             ListTile(
@@ -1062,14 +1048,16 @@ class _NotebookDetailScreenState extends State<NotebookDetailScreen> {
             title: const Text('Vorlage wechseln'),
             content: SizedBox(
               width: 300,
-              child: ListView(
-                shrinkWrap: true,
-                children: PaperType.values.map((pt) => RadioListTile<PaperType>(
-                  title: Text(pt.label),
-                  value: pt,
-                  groupValue: selected,
-                  onChanged: (v) => setLocal(() => selected = v!),
-                )).toList(),
+              child: RadioGroup<PaperType>(
+                groupValue: selected,
+                onChanged: (v) => setLocal(() => selected = v!),
+                child: ListView(
+                  shrinkWrap: true,
+                  children: PaperType.values.map((pt) => RadioListTile<PaperType>(
+                    title: Text(pt.label),
+                    value: pt,
+                  )).toList(),
+                ),
               ),
             ),
             actions: [

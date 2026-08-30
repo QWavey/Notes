@@ -3,7 +3,6 @@ import 'package:flutter/material.dart';
 import '../app_localizations.dart';
 import '../models/note_page.dart';
 import '../models/enums.dart';
-import '../widgets/paper_painter.dart';
 import 'draw_mode.dart';
 import 'document_mode.dart';
 

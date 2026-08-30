@@ -53,7 +53,7 @@ class PaperPainter extends CustomPainter {
     }
     // Red margin line
     final marginPaint = Paint()
-      ..color = const Color(0xFFFF6B6B).withOpacity(0.5)
+      ..color = const Color(0xFFFF6B6B).withValues(alpha: 0.5)
       ..strokeWidth = 1.0;
     canvas.drawLine(
         const Offset(60, 0), Offset(60, size.height), marginPaint);
@@ -72,7 +72,7 @@ class PaperPainter extends CustomPainter {
     }
     // Red margin line
     final marginPaint = Paint()
-      ..color = const Color(0xFFFF6B6B).withOpacity(0.5)
+      ..color = const Color(0xFFFF6B6B).withValues(alpha: 0.5)
       ..strokeWidth = 1.0;
     canvas.drawLine(
         const Offset(60, 0), Offset(60, size.height), marginPaint);
