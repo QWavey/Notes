@@ -1,5 +1,5 @@
 import 'dart:convert';
-import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:flutter/foundation.dart' show kIsWeb, debugPrint;
 import 'package:hive_flutter/hive_flutter.dart';
 import '../models/notebook.dart';
 import '../models/note_page.dart';
@@ -54,7 +54,10 @@ class StorageService {
     try {
       final arr = (jsonDecode(raw) as List).cast<String>();
       return arr.toSet();
-    } catch (_) {
+    } catch (e) {
+      // Keep the unreadable list so the next trash change cannot erase it.
+      debugPrint('Trashed notebook list could not be read: $e');
+      _keepBackup(_textBox, '__trashed_notebooks_backup__', raw);
       return <String>{};
     }
   }
@@ -121,8 +124,11 @@ class StorageService {
     await _drawingBox.delete(pageId);
     await _canvasBox.delete(pageId);
     await _textBox.delete(pageId);
-    // Rich-text spans are stored under their own key and must go with the page.
+    // Rich-text spans and the recovery copies are stored under their own keys
+    // and must go with the page.
     await _textBox.delete('${pageId}_spans');
+    await _canvasBox.delete('${pageId}_canvas_backup');
+    await _drawingBox.delete('${pageId}_drawing_backup');
   }
 
   // ─── Drawing data (pencil_field JSON) ──────────────────────────────────────
@@ -137,8 +143,20 @@ class StorageService {
     if (raw == null) return null;
     try {
       return jsonDecode(raw) as Map<String, dynamic>;
-    } catch (_) {
+    } catch (e) {
+      // Keep the unreadable copy: the caller treats null as a blank page and
+      // its next save would otherwise overwrite the stored drawing.
+      debugPrint('Drawing data for page $pageId could not be read: $e');
+      await _keepBackup(_drawingBox, '${pageId}_drawing_backup', raw);
       return null;
+    }
+  }
+
+  /// Stores [raw] under [key] unless a copy is already there. Called before a
+  /// save could overwrite stored data that failed to decode.
+  Future<void> _keepBackup(Box<String> box, String key, String raw) async {
+    if (!box.containsKey(key)) {
+      await box.put(key, raw);
     }
   }
 
@@ -151,9 +169,24 @@ class StorageService {
   Future<CanvasData> loadCanvasData(String pageId) async {
     final raw = _canvasBox.get(pageId);
     if (raw == null) return CanvasData();
+    final backupKey = '${pageId}_canvas_backup';
+    final skipped = <String>[];
     try {
-      return CanvasData.fromJson(jsonDecode(raw) as Map<String, dynamic>);
-    } catch (_) {
+      final data = CanvasData.fromJson(
+          jsonDecode(raw) as Map<String, dynamic>,
+          skipped: skipped);
+      if (skipped.isNotEmpty) {
+        // The unreadable entries would be dropped by the next save, so keep the
+        // original JSON first. Valid entries on the page still load.
+        debugPrint(
+            'Canvas data for page $pageId: skipped ${skipped.length} unreadable entries: ${skipped.join('; ')}');
+        await _keepBackup(_canvasBox, backupKey, raw);
+      }
+      return data;
+    } catch (e) {
+      // The whole blob is unreadable. Keep it before the next save replaces it.
+      debugPrint('Canvas data for page $pageId could not be read: $e');
+      await _keepBackup(_canvasBox, backupKey, raw);
       return CanvasData();
     }
   }

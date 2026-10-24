@@ -209,19 +209,36 @@ class TableItem {
         'colorValue': colorValue,
       };
 
-  factory TableItem.fromJson(Map<String, dynamic> j) => TableItem(
-        id: j['id'] as String,
-        x: (j['x'] as num).toDouble(),
-        y: (j['y'] as num).toDouble(),
-        cellWidth: (j['cellWidth'] as num? ?? 80).toDouble(),
-        cellHeight: (j['cellHeight'] as num? ?? 36).toDouble(),
-        rows: j['rows'] as int? ?? 3,
-        cols: j['cols'] as int? ?? 3,
-        cells: (j['cells'] as List<dynamic>? ?? [])
-            .map((row) => (row as List<dynamic>).map((c) => c as String).toList())
-            .toList(),
-        colorValue: j['colorValue'] as int? ?? 0xFF000000,
-      );
+  factory TableItem.fromJson(Map<String, dynamic> j) {
+    final rows = j['rows'] as int? ?? 3;
+    final cols = j['cols'] as int? ?? 3;
+    return TableItem(
+      id: j['id'] as String,
+      x: (j['x'] as num).toDouble(),
+      y: (j['y'] as num).toDouble(),
+      cellWidth: (j['cellWidth'] as num? ?? 80).toDouble(),
+      cellHeight: (j['cellHeight'] as num? ?? 36).toDouble(),
+      rows: rows,
+      cols: cols,
+      cells: _normalizeCells(j['cells'], rows, cols),
+      colorValue: j['colorValue'] as int? ?? 0xFF000000,
+    );
+  }
+
+  /// Returns a rows x cols grid. Missing or malformed entries become empty
+  /// strings and extra entries are dropped, so cells[row][col] is always valid.
+  static List<List<String>> _normalizeCells(Object? raw, int rows, int cols) {
+    final source = raw is List ? raw : const <dynamic>[];
+    final rowCount = rows < 0 ? 0 : rows;
+    final colCount = cols < 0 ? 0 : cols;
+    return List.generate(rowCount, (r) {
+      final row = r < source.length && source[r] is List
+          ? source[r] as List
+          : const <dynamic>[];
+      return List.generate(colCount,
+          (c) => c < row.length && row[c] is String ? row[c] as String : '');
+    });
+  }
 }
 
 // ─── Canvas Data ──────────────────────────────────────────────────────────────
@@ -249,18 +266,38 @@ class CanvasData {
         'tables': tables.map((t) => t.toJson()).toList(),
       };
 
-  factory CanvasData.fromJson(Map<String, dynamic> j) => CanvasData(
-        shapes: (j['shapes'] as List<dynamic>? ?? [])
-            .map((s) => ShapeItem.fromJson(s as Map<String, dynamic>))
-            .toList(),
-        textBoxes: (j['textBoxes'] as List<dynamic>? ?? [])
-            .map((t) => TextBoxItem.fromJson(t as Map<String, dynamic>))
-            .toList(),
-        images: (j['images'] as List<dynamic>? ?? [])
-            .map((i) => ImageItem.fromJson(i as Map<String, dynamic>))
-            .toList(),
-        tables: (j['tables'] as List<dynamic>? ?? [])
-            .map((t) => TableItem.fromJson(t as Map<String, dynamic>))
-            .toList(),
+  /// Decodes every entry on its own. An entry that cannot be read is described
+  /// in [skipped] (when given) and left out, so one bad item does not discard
+  /// the valid ones on the same page.
+  factory CanvasData.fromJson(Map<String, dynamic> j,
+          {List<String>? skipped}) =>
+      CanvasData(
+        shapes: _decodeEach(j['shapes'], 'shapes', ShapeItem.fromJson, skipped),
+        textBoxes: _decodeEach(
+            j['textBoxes'], 'textBoxes', TextBoxItem.fromJson, skipped),
+        images: _decodeEach(j['images'], 'images', ImageItem.fromJson, skipped),
+        tables: _decodeEach(j['tables'], 'tables', TableItem.fromJson, skipped),
       );
+
+  static List<T> _decodeEach<T>(
+    Object? raw,
+    String kind,
+    T Function(Map<String, dynamic>) decode,
+    List<String>? skipped,
+  ) {
+    if (raw == null) return <T>[];
+    if (raw is! List) {
+      skipped?.add('$kind: not a list');
+      return <T>[];
+    }
+    final out = <T>[];
+    for (var i = 0; i < raw.length; i++) {
+      try {
+        out.add(decode(raw[i] as Map<String, dynamic>));
+      } catch (e) {
+        skipped?.add('$kind[$i]: $e');
+      }
+    }
+    return out;
+  }
 }
