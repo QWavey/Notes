@@ -14,6 +14,18 @@ import 'package:path/path.dart' as p;
 // ExportService — PDF, image export with actual rendering
 // ---------------------------------------------------------------------------
 
+/// Turns a page or notebook title into a safe file name. Path separators and
+/// reserved characters become "_", leading dots and spaces are removed, and the
+/// length is capped, so a title cannot escape the chosen folder or break a name.
+String _safeFileName(String title) {
+  var name = title
+      .replaceAll(RegExp(r'[\\/:*?"<>|\x00-\x1F]'), '_')
+      .replaceFirst(RegExp(r'^[\s.]+'), '')
+      .trim();
+  if (name.length > 100) name = name.substring(0, 100).trim();
+  return name.isEmpty ? 'export' : name;
+}
+
 class ExportService {
   static Future<void> showExportDialog(
       BuildContext context, String pageTitle,
@@ -66,7 +78,8 @@ class ExportService {
         build: (_) => pw.Image(image, fit: pw.BoxFit.contain),
       ));
       final bytes = await doc.save();
-      await Printing.sharePdf(bytes: bytes, filename: '$title.pdf');
+      await Printing.sharePdf(
+          bytes: bytes, filename: '${_safeFileName(title)}.pdf');
     } catch (e) {
       messenger.showSnackBar(
           SnackBar(content: Text('PDF export fehlgeschlagen: $e')));
@@ -89,7 +102,8 @@ class ExportService {
         await SharePlus.instance.share(
           ShareParams(
             files: [
-              XFile.fromData(bytes, name: '$title.$ext', mimeType: 'image/png'),
+              XFile.fromData(bytes,
+                  name: '${_safeFileName(title)}.$ext', mimeType: 'image/png'),
             ],
           ),
         );
@@ -97,7 +111,7 @@ class ExportService {
         // On native: save via file_picker
         final path = await FilePicker.platform.saveFile(
           dialogTitle: 'Bild speichern',
-          fileName: '$title.$ext',
+          fileName: '${_safeFileName(title)}.$ext',
           bytes: bytes,
         );
         if (path != null) {
