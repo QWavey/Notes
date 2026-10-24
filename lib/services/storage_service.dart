@@ -90,16 +90,17 @@ class StorageService {
   }
 
   Future<void> deleteNotebook(String id) async {
-    // Ensure it disappears from trash metadata when hard-deleted.
-    final ids = getTrashedNotebookIds();
-    if (ids.remove(id)) {
-      await _saveTrashedNotebookIds(ids);
-    }
+    // Remove the data first and clear the trash marker last. If a step fails,
+    // the notebook stays in the trash instead of reappearing in the active grid.
     final pages = getPagesForNotebook(id);
     for (final p in pages) {
       await deletePage(p.id);
     }
     await _notebookBox.delete(id);
+    final ids = getTrashedNotebookIds();
+    if (ids.remove(id)) {
+      await _saveTrashedNotebookIds(ids);
+    }
   }
 
   // ─── Pages ─────────────────────────────────────────────────────────────────
@@ -120,6 +121,8 @@ class StorageService {
     await _drawingBox.delete(pageId);
     await _canvasBox.delete(pageId);
     await _textBox.delete(pageId);
+    // Rich-text spans are stored under their own key and must go with the page.
+    await _textBox.delete('${pageId}_spans');
   }
 
   // ─── Drawing data (pencil_field JSON) ──────────────────────────────────────
