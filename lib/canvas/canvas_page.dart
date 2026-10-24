@@ -61,22 +61,44 @@ class CanvasPageState extends State<CanvasPage>
   }
 
   @override
+  void deactivate() {
+    // Save here rather than in dispose(): by the time dispose() runs, the child
+    // states behind _drawKey and _docKey are already unmounted, so the save
+    // would silently do nothing and recent edits would be lost.
+    _saveNow().catchError((Object e) {
+      debugPrint('Saving the page on leave failed: $e');
+    });
+    super.deactivate();
+  }
+
+  @override
   void dispose() {
     _autosaveTimer?.cancel();
-    // Best-effort synchronous-ish save on dispose.
-    _drawKey.currentState?.saveAll();
-    _docKey.currentState?.saveText();
     _tabController.dispose();
     super.dispose();
   }
 
   void _markDirty() => _dirty = true;
 
+  /// Saves both editors. Both states are read before the first await, so a
+  /// child that unmounts while the drawing is saved still gets its save.
+  Future<void> _saveNow() async {
+    final draw = _drawKey.currentState;
+    final doc = _docKey.currentState;
+    await draw?.saveAll();
+    await doc?.saveText();
+  }
+
   Future<void> _autoSave() async {
     if (!_dirty) return;
     _dirty = false;
-    await _drawKey.currentState?.saveAll();
-    await _docKey.currentState?.saveText();
+    try {
+      await _saveNow();
+    } catch (e) {
+      // Keep the edits marked as unsaved so the next tick retries them.
+      _dirty = true;
+      debugPrint('Autosave failed, will retry: $e');
+    }
   }
 
   @override
