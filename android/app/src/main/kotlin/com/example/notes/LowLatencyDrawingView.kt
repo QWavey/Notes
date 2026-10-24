@@ -233,6 +233,9 @@ class LowLatencyDrawingView(
 
     // ── SurfaceHolder Callback ───────────────────────────────────────────────
     override fun surfaceCreated(holder: SurfaceHolder) {
+        // A new surface gets a new EGL context, so the GL program must be built again.
+        resetGLState()
+
         // Create Motion Event Predictor
         motionEventPredictor = MotionEventPredictor.newInstance(this)
 
@@ -318,6 +321,10 @@ class LowLatencyDrawingView(
                 }
             }
         })
+
+        // Redraw the strokes that already exist. Without this they stay hidden
+        // until the next stroke or clear.
+        triggerRedraw()
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
@@ -329,6 +336,16 @@ class LowLatencyDrawingView(
         frontBufferRenderer?.release(true)
         frontBufferRenderer = null
         motionEventPredictor = null
+        resetGLState()
+    }
+
+    // The program and its handles belong to the EGL context that created them.
+    // Forget them whenever that context is released, so initGL rebuilds them.
+    private fun resetGLState() {
+        glProgram = 0
+        positionHandle = 0
+        colorHandle = 0
+        mvpMatrixHandle = 0
     }
 
     // ── OpenGL Drawing Helpers ────────────────────────────────────────────────
@@ -354,11 +371,21 @@ class LowLatencyDrawingView(
         val vertexShader = loadShader(GLES20.GL_VERTEX_SHADER, vertexShaderCode)
         val fragmentShader = loadShader(GLES20.GL_FRAGMENT_SHADER, fragmentShaderCode)
         
-        glProgram = GLES20.glCreateProgram().also {
-            GLES20.glAttachShader(it, vertexShader)
-            GLES20.glAttachShader(it, fragmentShader)
-            GLES20.glLinkProgram(it)
+        val program = GLES20.glCreateProgram()
+        GLES20.glAttachShader(program, vertexShader)
+        GLES20.glAttachShader(program, fragmentShader)
+        GLES20.glLinkProgram(program)
+
+        val linkStatus = IntArray(1)
+        GLES20.glGetProgramiv(program, GLES20.GL_LINK_STATUS, linkStatus, 0)
+        if (linkStatus[0] == 0) {
+            // glProgram stays 0, so the next callback tries again.
+            Log.e(TAG, "GL program link failed: " + GLES20.glGetProgramInfoLog(program))
+            GLES20.glDeleteProgram(program)
+            return
         }
+
+        glProgram = program
         
         positionHandle = GLES20.glGetAttribLocation(glProgram, "aPosition")
         colorHandle = GLES20.glGetUniformLocation(glProgram, "uColor")
@@ -369,10 +396,15 @@ class LowLatencyDrawingView(
     }
 
     private fun loadShader(type: Int, shaderCode: String): Int {
-        return GLES20.glCreateShader(type).also { shader ->
-            GLES20.glShaderSource(shader, shaderCode)
-            GLES20.glCompileShader(shader)
+        val shader = GLES20.glCreateShader(type)
+        GLES20.glShaderSource(shader, shaderCode)
+        GLES20.glCompileShader(shader)
+        val compiled = IntArray(1)
+        GLES20.glGetShaderiv(shader, GLES20.GL_COMPILE_STATUS, compiled, 0)
+        if (compiled[0] == 0) {
+            Log.e(TAG, "GL shader compile failed: " + GLES20.glGetShaderInfoLog(shader))
         }
+        return shader
     }
 
     private fun setupViewport(width: Int, height: Int): FloatArray {
@@ -413,6 +445,7 @@ class LowLatencyDrawingView(
     }
 
     private fun drawStroke(stroke: StrokeData, mvpMatrix: FloatArray) {
+        if (glProgram == 0) return // no usable program yet (not built, or link failed)
         val points = stroke.points
         if (points.size < 2) return
         
