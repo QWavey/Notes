@@ -29,8 +29,15 @@ class StorageService {
       final docsDir = await platform.getDocsDir();
       await Hive.initFlutter(docsDir);
     }
-    Hive.registerAdapter(NotebookAdapter());
-    Hive.registerAdapter(NotePageAdapter());
+    // Register each adapter once, so init can be retried after a failure.
+    final notebookAdapter = NotebookAdapter();
+    if (!Hive.isAdapterRegistered(notebookAdapter.typeId)) {
+      Hive.registerAdapter(notebookAdapter);
+    }
+    final pageAdapter = NotePageAdapter();
+    if (!Hive.isAdapterRegistered(pageAdapter.typeId)) {
+      Hive.registerAdapter(pageAdapter);
+    }
     _notebookBox = await Hive.openBox<Notebook>('notebooks');
     _pageBox = await Hive.openBox<NotePage>('pages');
     _drawingBox = await Hive.openBox<String>('drawings');
