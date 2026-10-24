@@ -47,9 +47,13 @@ class ExportService {
     }
   }
 
-  /// Export current canvas as PDF using flutter/printing
+  /// Export current canvas as PDF using flutter/printing.
+  ///
+  /// Takes the [ScaffoldMessengerState] captured before the export dialog was
+  /// closed. The dialog's own BuildContext is unmounted by then, so using it
+  /// here would silently drop the share sheet and any error message.
   static Future<void> exportAsPdf(
-      BuildContext context, String title,
+      ScaffoldMessengerState messenger, String title,
       Future<Uint8List> Function() renderPage) async {
     try {
       final imageBytes = await renderPage();
@@ -61,28 +65,22 @@ class ExportService {
         build: (_) => pw.Image(image, fit: pw.BoxFit.contain),
       ));
       final bytes = await doc.save();
-      if (context.mounted) {
-        await Printing.sharePdf(bytes: bytes, filename: '$title.pdf');
-      }
+      await Printing.sharePdf(bytes: bytes, filename: '$title.pdf');
     } catch (e) {
-      if (context.mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('PDF export fehlgeschlagen: $e')));
-      }
+      messenger.showSnackBar(
+          SnackBar(content: Text('PDF export fehlgeschlagen: $e')));
     }
   }
 
-  /// Export as PNG/JPG image
+  /// Export as PNG image (see [exportAsPdf] for why a messenger is passed in).
   static Future<void> exportAsImage(
-      BuildContext context, String title,
+      ScaffoldMessengerState messenger, String title,
       GlobalKey repaintKey, String ext) async {
     try {
       final bytes = await captureWidget(repaintKey);
       if (bytes == null) {
-        if (context.mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(content: Text('Export: Konnte Seite nicht erfassen')));
-        }
+        messenger.showSnackBar(
+            const SnackBar(content: Text('Export: Konnte Seite nicht erfassen')));
         return;
       }
       if (kIsWeb) {
@@ -96,16 +94,14 @@ class ExportService {
           fileName: '$title.$ext',
           bytes: bytes,
         );
-        if (path != null && context.mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
+        if (path != null) {
+          messenger.showSnackBar(
               SnackBar(content: Text('Gespeichert: $path')));
         }
       }
     } catch (e) {
-      if (context.mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('Bild-Export fehlgeschlagen: $e')));
-      }
+      messenger.showSnackBar(
+          SnackBar(content: Text('Bild-Export fehlgeschlagen: $e')));
     }
   }
 }
@@ -146,16 +142,19 @@ class _ExportDialog extends StatelessWidget {
       title: Text(label, style: const TextStyle(fontSize: 14)),
       dense: true,
       onTap: () {
+        // Capture the messenger BEFORE popping the dialog: once it is closed,
+        // its BuildContext is unmounted and can no longer show messages.
+        final messenger = ScaffoldMessenger.of(context);
         Navigator.pop(context);
-        _doExport(context, format);
+        _doExport(messenger, format);
       },
     );
   }
 
-  void _doExport(BuildContext context, String format) async {
+  Future<void> _doExport(ScaffoldMessengerState messenger, String format) async {
     final key = repaintKey;
     if (key == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
+      messenger.showSnackBar(
         SnackBar(content: Text('Export als .$format — kein RepaintBoundary verfügbar')),
       );
       return;
@@ -164,19 +163,13 @@ class _ExportDialog extends StatelessWidget {
     if (format == 'pdf') {
       final bytes = await ExportService.captureWidget(key);
       if (bytes == null) {
-        if (context.mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(content: Text('Export: Seite konnte nicht erfasst werden')));
-        }
+        messenger.showSnackBar(
+            const SnackBar(content: Text('Export: Seite konnte nicht erfasst werden')));
         return;
       }
-      if (context.mounted) {
-        await ExportService.exportAsPdf(context, pageTitle, () async => bytes);
-      }
+      await ExportService.exportAsPdf(messenger, pageTitle, () async => bytes);
     } else {
-      if (context.mounted) {
-        await ExportService.exportAsImage(context, pageTitle, key, format);
-      }
+      await ExportService.exportAsImage(messenger, pageTitle, key, format);
     }
   }
 }
