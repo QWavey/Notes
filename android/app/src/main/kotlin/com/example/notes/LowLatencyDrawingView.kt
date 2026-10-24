@@ -6,6 +6,7 @@ import android.graphics.PixelFormat
 import android.graphics.PointF
 import android.opengl.GLES20
 import android.opengl.Matrix
+import android.util.Log
 import android.view.MotionEvent
 import android.view.Surface
 import android.view.SurfaceHolder
@@ -23,6 +24,8 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
 
+private const val TAG = "LowLatencyDrawingView"
+
 class LowLatencyDrawingView(
     context: Context,
     private val id: Int,
@@ -37,9 +40,15 @@ class LowLatencyDrawingView(
         var color: Int = Color.BLACK,
         var width: Float = 5.0f,
         var penType: Int = 1 // 0=fountain, 1=ballpoint, 2=brush
-    )
+    ) {
+        /** Copy made on the UI thread so the render thread never reads a list that is still growing. */
+        fun snapshot(): StrokeData = copy(points = points.toMutableList())
+    }
 
+    // Only the UI thread touches completedStrokes. The render thread reads renderedStrokes,
+    // an immutable copy that publishStrokes() replaces after every change.
     private val completedStrokes = mutableListOf<StrokeData>()
+    @Volatile private var renderedStrokes: List<StrokeData> = emptyList()
     private var activeStroke: StrokeData? = null
     
     // Pen settings
@@ -141,8 +150,13 @@ class LowLatencyDrawingView(
         }
     }
 
+    private fun publishStrokes() {
+        renderedStrokes = completedStrokes.toList()
+    }
+
     private fun triggerRedraw() {
-        frontBufferRenderer?.renderMultiBufferedLayer(completedStrokes)
+        publishStrokes()
+        frontBufferRenderer?.renderMultiBufferedLayer(renderedStrokes)
     }
 
     // ── Touch / Stylus Event Handling ─────────────────────────────────────────
@@ -170,7 +184,7 @@ class LowLatencyDrawingView(
                 activeStroke = stroke
 
                 // Render front buffer
-                frontBufferRenderer?.renderFrontBufferedLayer(stroke)
+                frontBufferRenderer?.renderFrontBufferedLayer(stroke.snapshot())
             }
             MotionEvent.ACTION_MOVE -> {
                 val stroke = activeStroke ?: return true
@@ -183,7 +197,7 @@ class LowLatencyDrawingView(
                 stroke.points.add(PointF(x, y))
 
                 // Render front buffer
-                frontBufferRenderer?.renderFrontBufferedLayer(stroke)
+                frontBufferRenderer?.renderFrontBufferedLayer(stroke.snapshot())
             }
             MotionEvent.ACTION_UP -> {
                 val stroke = activeStroke ?: return true
@@ -191,6 +205,7 @@ class LowLatencyDrawingView(
                 
                 // Add to completed strokes and commit to double buffer
                 completedStrokes.add(stroke)
+                publishStrokes()
                 frontBufferRenderer?.commit()
                 
                 // Notify Flutter that a stroke has finished
@@ -297,8 +312,8 @@ class LowLatencyDrawingView(
                 GLES20.glClearColor(0.0f, 0.0f, 0.0f, 0.0f)
                 GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
                 
-                // Draw all completed strokes
-                for (stroke in completedStrokes) {
+                // Draw the latest published snapshot, never the live list the UI thread is changing
+                for (stroke in renderedStrokes) {
                     drawStroke(stroke, mvpMatrix)
                 }
             }
@@ -374,16 +389,24 @@ class LowLatencyDrawingView(
 
     private fun getVertexBuffer(capacityInPoints: Int): FloatBuffer {
         val requiredBytes = capacityInPoints * 2 * 4 // 2 floats per point, 4 bytes per float
+        // Read each field once into a local. dispose() may null them on the UI thread,
+        // so the !! force-unwrap that could fail is gone.
         val currentBuffer = rawByteBuffer
-        if (currentBuffer == null || currentBuffer.capacity() < requiredBytes) {
+        val currentFloats = vertexBuffer
+        if (currentBuffer == null || currentFloats == null || currentBuffer.capacity() < requiredBytes) {
             val newCapacity = Math.max(requiredBytes, (currentBuffer?.capacity() ?: 0) * 2)
             val newBuffer = ByteBuffer.allocateDirect(newCapacity).apply {
                 order(ByteOrder.nativeOrder())
             }
+            val newFloats = newBuffer.asFloatBuffer()
             rawByteBuffer = newBuffer
-            vertexBuffer = newBuffer.asFloatBuffer()
+            vertexBuffer = newFloats
+            return newFloats.apply {
+                clear()
+                position(0)
+            }
         }
-        return vertexBuffer!!.apply {
+        return currentFloats.apply {
             clear()
             position(0)
         }
