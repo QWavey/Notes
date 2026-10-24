@@ -43,3 +43,8 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Generated Gradle output and local scratch files (not part of the project)
+/android/build/
+/pkg_*.txt
+/read_pkg.ps1
