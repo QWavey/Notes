@@ -7,6 +7,7 @@ import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:share_plus/share_plus.dart';
 import 'package:path/path.dart' as p;
 
 // ---------------------------------------------------------------------------
@@ -84,9 +85,14 @@ class ExportService {
         return;
       }
       if (kIsWeb) {
-        // On web: share via printing package
-        await Printing.sharePdf(
-          bytes: bytes, filename: '$title.$ext');
+        // On web: share the PNG bytes as an image (not as a PDF).
+        await SharePlus.instance.share(
+          ShareParams(
+            files: [
+              XFile.fromData(bytes, name: '$title.$ext', mimeType: 'image/png'),
+            ],
+          ),
+        );
       } else {
         // On native: save via file_picker
         final path = await FilePicker.platform.saveFile(
@@ -123,8 +129,8 @@ class _ExportDialog extends StatelessWidget {
         mainAxisSize: MainAxisSize.min,
         children: [
           _formatTile(context, Icons.picture_as_pdf, 'PDF (.pdf)', 'pdf'),
+          // The image option always produces PNG bytes, so it is offered only as .png.
           _formatTile(context, Icons.image, 'Bild (.png)', 'png'),
-          _formatTile(context, Icons.image, 'Bild (.jpg)', 'jpg'),
         ],
       ),
       actions: [
